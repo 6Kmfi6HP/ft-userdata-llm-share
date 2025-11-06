@@ -55,6 +55,13 @@ class ContextBuilder:
         latest = dataframe.iloc[-1]
         prev = dataframe.iloc[-2] if len(dataframe) > 1 else latest
 
+        # Calculate price change safely (avoid division by zero)
+        if prev['close'] != 0:
+            price_change_pct = ((latest['close'] - prev['close']) / prev['close'] * 100)
+            price_change_str = f"  价格变化: {price_change_pct:.2f}%"
+        else:
+            price_change_str = "  价格变化: N/A (invalid previous price)"
+
         context_parts = [
             f"=" * 60,
             f"交易对: {pair}",
@@ -65,7 +72,7 @@ class ContextBuilder:
             f"  当前价格: {latest['close']:.8f}",
             f"  开盘: {latest['open']:.8f}  最高: {latest['high']:.8f}  最低: {latest['low']:.8f}",
             f"  成交量: {latest['volume']:.2f}",
-            f"  价格变化: {((latest['close'] - prev['close']) / prev['close'] * 100):.2f}%",
+            price_change_str,
         ]
 
         # 添加市场情绪指标
