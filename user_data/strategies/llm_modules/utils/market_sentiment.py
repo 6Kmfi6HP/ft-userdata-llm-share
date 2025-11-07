@@ -129,7 +129,7 @@ class MarketSentiment:
             'rate': 0.0001,  # 当前资金费率
             'rate_pct': 0.01,  # 百分比形式
             'next_funding_time': 1234567890,
-            'interpretation': '多头疯狂，做空机会'
+            'interpretation': '多头极度过热(0.010%，多头付费给空头)'
         }
         """
         try:
@@ -163,29 +163,29 @@ class MarketSentiment:
             return None
 
     def _interpret_fear_greed(self, value: int, trend: str, duration_days: int = 0) -> str:
-        """解释恐惧与贪婪指数"""
+        """解释恐惧与贪婪指数 - 仅提供客观描述，不做主观判断"""
         interpretations = []
 
-        # 当前状态
+        # 当前状态 - 只描述情绪，不提供交易建议
         if value <= 20:
-            interpretations.append("极度恐惧(可能筑底，反向做多机会)")
+            interpretations.append("极度恐惧")
         elif value <= 40:
-            interpretations.append("恐惧(偏空情绪)")
+            interpretations.append("恐惧")
         elif value <= 60:
             interpretations.append("中性")
         elif value <= 80:
-            interpretations.append("贪婪(偏多情绪)")
+            interpretations.append("贪婪")
         else:
-            interpretations.append("极度贪婪(可能见顶，做空机会)")
+            interpretations.append("极度贪婪")
 
-        # 持续时间分析
+        # 持续时间分析 - 客观描述
         if duration_days > 0:
             interpretations.append(f"已持续{duration_days}天")
             if duration_days >= 5:
                 if value <= 40:
-                    interpretations.append("长期恐惧可能筑底")
+                    interpretations.append("长期处于恐惧状态")
                 elif value >= 60:
-                    interpretations.append("长期贪婪可能见顶")
+                    interpretations.append("长期处于贪婪状态")
 
         # 短期趋势
         if trend == 'rising':
@@ -197,7 +197,7 @@ class MarketSentiment:
 
     def _interpret_funding_rate(self, rate_pct: float) -> str:
         """
-        解释资金费率
+        解释资金费率 - 仅提供客观描述，不做主观判断
 
         资金费率含义:
         - 正值: 多头付费给空头 (多头过热)
@@ -205,15 +205,15 @@ class MarketSentiment:
         - 一般范围: -0.1% 到 0.1%
         """
         if rate_pct > 0.1:
-            return f"多头疯狂({rate_pct:.3f}%，多头付费，做空机会)"
+            return f"多头极度过热({rate_pct:.3f}%，多头付费给空头)"
         elif rate_pct > 0.05:
-            return f"多头过热({rate_pct:.3f}%，偏多情绪)"
+            return f"多头过热({rate_pct:.3f}%)"
         elif rate_pct > -0.05:
-            return f"市场平衡({rate_pct:.3f}%，中性)"
+            return f"市场平衡({rate_pct:.3f}%)"
         elif rate_pct > -0.1:
-            return f"空头过热({rate_pct:.3f}%，偏空情绪)"
+            return f"空头过热({rate_pct:.3f}%)"
         else:
-            return f"空头疯狂({rate_pct:.3f}%，空头付费，做多机会)"
+            return f"空头极度过热({rate_pct:.3f}%，空头付费给多头)"
 
     def get_long_short_ratio(self, pair: str) -> Optional[Dict[str, Any]]:
         """
@@ -349,9 +349,9 @@ class MarketSentiment:
         """解释多空比"""
         interpretations = []
 
-        # 当前状态
+        # 当前状态 - 只描述多空力量对比，不提供交易建议
         if ratio > 2.0:
-            interpretations.append(f"多头过热({ratio:.2f}，做空机会)")
+            interpretations.append(f"多头极度过热({ratio:.2f})")
         elif ratio > 1.5:
             interpretations.append(f"多头偏强({ratio:.2f})")
         elif ratio > 1.2:
@@ -361,13 +361,13 @@ class MarketSentiment:
         elif ratio > 0.5:
             interpretations.append(f"空头略占优({ratio:.2f})")
         else:
-            interpretations.append(f"空头过热({ratio:.2f}，做多机会)")
+            interpretations.append(f"空头极度过热({ratio:.2f})")
 
-        # 持续时间
+        # 持续时间 - 客观描述
         if duration_hours >= 24:
             interpretations.append(f"已持续{duration_hours}小时")
             if extreme in ['extreme_long', 'extreme_short']:
-                interpretations.append("长期极端可能反转")
+                interpretations.append("长期处于极端状态")
 
         # 趋势
         if trend == 'bullish':
@@ -393,29 +393,30 @@ class MarketSentiment:
         funding_rate = self.get_funding_rate(exchange, pair)
         long_short = self.get_long_short_ratio(pair)
 
-        # 综合判断
+        # 综合判断 - 基于逆向思维的信号聚合
+        # 注意：此信号仅供参考，实际决策需结合趋势、结构、持仓状态等完整上下文
         signals = []
 
         if fear_greed:
             fg_value = fear_greed['value']
             if fg_value <= 20:
-                signals.append('bullish')  # 极度恐惧 = 买入机会
+                signals.append('bullish')  # 极度恐惧（逆向信号）
             elif fg_value >= 80:
-                signals.append('bearish')  # 极度贪婪 = 做空机会
+                signals.append('bearish')  # 极度贪婪（逆向信号）
 
         if funding_rate:
             fr_pct = funding_rate['rate_pct']
             if fr_pct > 0.1:
-                signals.append('bearish')  # 多头疯狂 = 做空机会
+                signals.append('bearish')  # 多头极度过热
             elif fr_pct < -0.1:
-                signals.append('bullish')  # 空头疯狂 = 做多机会
+                signals.append('bullish')  # 空头极度过热
 
         if long_short:
             ls_ratio = long_short['current_ratio']
             if ls_ratio > 2.0:
-                signals.append('bearish')  # 多头过热 = 做空机会
+                signals.append('bearish')  # 多头极度过热
             elif ls_ratio < 0.5:
-                signals.append('bullish')  # 空头过热 = 做多机会
+                signals.append('bullish')  # 空头极度过热
 
         # 综合信号
         if len(signals) == 0:
