@@ -204,6 +204,35 @@ class LLMClient:
             if self.max_tokens is not None:
                 payload["max_tokens"] = self.max_tokens
 
+            # 记录完整的prompt信息（控制台输出）
+            logger.info("=" * 80)
+            logger.info("📤 发送给LLM的完整信息")
+            logger.info("=" * 80)
+            logger.info(f"模型: {self.model}")
+            logger.info(f"消息数量: {len(messages)}")
+            logger.info(f"可用函数数量: {len(functions)}")
+            logger.info("-" * 80)
+
+            # 打印每条消息（完整不截取）
+            for idx, msg in enumerate(messages, 1):
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")
+                logger.info(f"消息 #{idx} [角色: {role}]")
+                if content:
+                    logger.info(f"完整内容:\n{content}")
+
+                # 如果有tool_calls，也打印出来
+                if "tool_calls" in msg:
+                    logger.info(f"Tool Calls: {json.dumps(msg['tool_calls'], ensure_ascii=False, indent=2)}")
+
+                logger.info("-" * 80)
+
+            # 打印可用的函数列表（完整）
+            logger.info("可用函数列表:")
+            for func in functions:
+                logger.info(f"  - {func.get('name', 'unknown')}: {func.get('description', 'no description')}")
+            logger.info("=" * 80)
+
             logger.debug(f"调用LLM API: {self.model}")
 
             response = requests.post(
@@ -217,7 +246,44 @@ class LLMClient:
                 logger.error(f"API返回错误: {response.status_code} - {response.text}")
                 return None
 
-            return response.json()
+            response_json = response.json()
+
+            # 记录LLM的响应（完整不截取）
+            logger.info("=" * 80)
+            logger.info("📥 LLM返回的完整响应")
+            logger.info("=" * 80)
+            choice = response_json.get("choices", [{}])[0]
+            message = choice.get("message", {})
+            finish_reason = choice.get("finish_reason", "")
+
+            logger.info(f"完成原因: {finish_reason}")
+
+            # 提取并打印内容（完整）
+            content = message.get("content", "")
+            if content:
+                logger.info(f"响应内容（完整）:\n{content}")
+
+            # 打印思考过程（完整）
+            think = message.get("think", "")
+            reasoning = message.get("reasoning", "")
+            if think:
+                logger.info(f"思考过程（完整）:\n{think}")
+            if reasoning:
+                logger.info(f"推理过程（完整）:\n{reasoning}")
+
+            # 打印tool_calls（完整）
+            tool_calls = message.get("tool_calls", [])
+            if tool_calls:
+                logger.info(f"函数调用数量: {len(tool_calls)}")
+                for tc in tool_calls:
+                    func_name = tc.get("function", {}).get("name", "unknown")
+                    func_args = tc.get("function", {}).get("arguments", "{}")
+                    logger.info(f"  调用函数: {func_name}")
+                    logger.info(f"  完整参数: {func_args}")
+
+            logger.info("=" * 80)
+
+            return response_json
 
         except requests.Timeout:
             logger.error("API请求超时")
