@@ -31,7 +31,8 @@ class ContextBuilder:
         metadata: Dict[str, Any],
         wallets: Any = None,
         current_trades: Optional[List[Any]] = None,
-        exchange: Any = None
+        exchange: Any = None,
+        stoploss_cache: Optional[Dict[str, float]] = None
     ) -> str:
         """
         构建完整的市场上下文（一次性提供所有数据）
@@ -213,18 +214,29 @@ class ContextBuilder:
                     open_rate = getattr(trade, 'open_rate', 0)
                     stake = getattr(trade, 'stake_amount', 0)
                     leverage = getattr(trade, 'leverage', 1)
-                    stop_loss_pct = getattr(trade, 'stop_loss_pct', None)
                     enter_tag = getattr(trade, 'enter_tag', '')
                     open_date = getattr(trade, 'open_date', None)
+                    pair_name = getattr(trade, 'pair', '')
 
-                    # 计算止损价格
-                    if stop_loss_pct is not None:
+                    # 从stoploss_cache获取LLM设置的账户止损百分比
+                    account_stop_loss_pct = None
+                    if stoploss_cache and pair_name in stoploss_cache:
+                        account_stop_loss_pct = stoploss_cache[pair_name]
+
+                    # 计算止损价格（基于LLM设置的账户止损百分比）
+                    if account_stop_loss_pct is not None:
+                        # 账户止损 = 价格变动% × 杠杆
+                        # 所以：价格变动% = 账户止损 / 杠杆
+                        price_tolerance_pct = account_stop_loss_pct / leverage
+
                         if is_short:
                             # 做空：止损在开仓价上方
-                            stop_price = open_rate * (1 + abs(stop_loss_pct) / leverage)
+                            # price_tolerance_pct是负数，如-22.02，所以 1 - (-22.02)/100 = 1.2202
+                            stop_price = open_rate * (1 - price_tolerance_pct / 100)
                         else:
                             # 做多：止损在开仓价下方
-                            stop_price = open_rate * (1 - abs(stop_loss_pct) / leverage)
+                            # price_tolerance_pct是负数，如-22.02，所以 1 + (-22.02)/100 = 0.7798
+                            stop_price = open_rate * (1 + price_tolerance_pct / 100)
 
                         # 计算当前到止损位的距离
                         distance_to_stop = abs(current_price - stop_price) / current_price * 100
@@ -264,8 +276,20 @@ class ContextBuilder:
                     context_parts.append(f"    当前盈亏: {profit_pct:+.2f}% ({profit_pct * stake / 100:+.2f}U)")
 
                     # 止损信息
-                    if stop_price:
-                        context_parts.append(f"    止损位: {stop_price:.6f} (距离{distance_to_stop:.2f}%)")
+                    if stop_price and account_stop_loss_pct:
+                        if is_short:
+                            if current_price >= stop_price:
+                                stop_status = "⚠️ 已触发！"
+                            else:
+                                stop_status = f"还有{distance_to_stop:.2f}%空间"
+                        else:
+                            if current_price <= stop_price:
+                                stop_status = "⚠️ 已触发！"
+                            else:
+                                stop_status = f"还有{distance_to_stop:.2f}%空间"
+
+                        context_parts.append(f"    你设定的止损: 账户亏损{abs(account_stop_loss_pct):.2f}%时平仓")
+                        context_parts.append(f"    对应价格: {stop_price:.6f} ({stop_status})")
 
                     context_parts.append(f"    持仓时间: {time_str}")
                     context_parts.append(f"    投入: {stake:.2f}U")
@@ -606,6 +630,12 @@ class ContextBuilder:
 
 4. signal_exit(pair, limit_price, confidence_score, rsi_value, reason)
    功能：主动平掉全部持仓
+
+   ⚠️ 止损检查（必须每次检查）：
+   - 系统会显示"你设定的止损"和对应价格
+   - 如果看到"⚠️ 已触发！"，必须立即调用signal_exit平仓
+   - 你设置的止损价格是固定的，基于开仓时的风险评估
+   - 不要犹豫，到达止损价必须执行
 
    核心原则（必读）：
    只有当市场走势对你的持仓不利时才应平仓。
