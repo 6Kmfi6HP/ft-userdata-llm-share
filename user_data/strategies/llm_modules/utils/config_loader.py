@@ -55,8 +55,8 @@ class ConfigLoader:
         """获取默认配置"""
         return {
             "llm_config": {
-                "api_base": "http://localhost:3120",
-                "api_key": "",
+                "api_base": "http://host.docker.internal:3120",
+                "api_key": "sk-xrAnFvo5PrbVXuqYS7WdVahVPRCg5CGJ1nVEqNYDQjNOgYvW",
                 "model": "qwen/qwen3-coder-30b",
                 "embedding_model": "text-embedding-bge-m3",
                 "temperature": 0.7,
@@ -70,7 +70,13 @@ class ConfigLoader:
                 "min_similarity": 0.7,
                 "storage_path": "./user_data/data/vector_store",
                 "max_history_size": 10000,
-                "cleanup_days": 30
+                "cleanup_days": 30,
+                "max_document_chars": 4000,
+                "skip_sections": [
+                    "【关键指标历史",
+                    "【K线历史",
+                    "【多时间框架K线数据】"
+                ]
             },
             "risk_management": {
                 "max_leverage": 100,
@@ -90,7 +96,37 @@ class ConfigLoader:
                 "system_prompt_tokens": 500,
                 "market_data_tokens": 800,
                 "rag_history_tokens": 1500,
-                "enable_context_compression": True
+                "enable_context_compression": True,
+                "include_timeframe_alignment": True,
+                "include_timeframe_guidance": True,
+                "include_multi_timeframe_data": True,
+                "indicator_history_points": 20,
+                "indicator_history_lookback": 100,
+                "raw_kline_history_points": 0,
+                "raw_kline_max_rows": 120,
+                "raw_kline_stride": 1,
+                "raw_kline_compact_format": True,
+                "raw_kline_extra_fields": [
+                    "ema_20",
+                    "ema_50",
+                    "rsi",
+                    "macd",
+                    "macd_signal",
+                    "macd_hist"
+                ],
+                "multi_timeframe_compact_format": True,
+                "multi_timeframe_max_rows": 120,
+                "default_multi_timeframe_fields": [
+                    "ema_20",
+                    "ema_50",
+                    "rsi",
+                    "macd",
+                    "macd_signal",
+                    "macd_hist",
+                    "atr",
+                    "adx"
+                ],
+                "multi_timeframe_history": {}
             }
         }
 

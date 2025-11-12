@@ -1,6 +1,7 @@
 """
 经验管理器模块
 管理交易经验的存储、分析和学习
+集成 RAG 系统进行语义检索和学习
 """
 import logging
 from typing import Dict, Any, List, Optional
@@ -11,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class ExperienceManager:
-    """经验学习管理器"""
+    """经验学习管理器（集成RAG）"""
 
     def __init__(self, trade_logger, rag_manager=None):
         """
@@ -19,7 +20,7 @@ class ExperienceManager:
 
         Args:
             trade_logger: 交易日志记录器
-            rag_manager: RAG管理器(可选)
+            rag_manager: RAG管理器（可选）
         """
         self.trade_logger = trade_logger
         self.rag_manager = rag_manager
@@ -29,7 +30,10 @@ class ExperienceManager:
         self._recent_mistakes: List[Dict[str, Any]] = []
         self._success_patterns: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
-        logger.info("经验管理器已初始化")
+        if self.rag_manager:
+            logger.info("经验管理器已初始化（RAG模式）")
+        else:
+            logger.info("经验管理器已初始化（传统模式）")
 
     def log_decision_with_context(
         self,
@@ -64,21 +68,6 @@ class ExperienceManager:
             function_calls=function_calls
         )
 
-        # 存储到RAG系统
-        if self.rag_manager and self.rag_manager.enabled:
-            market_desc = self._format_market_context(market_context)
-            self.rag_manager.store_decision(
-                pair=pair,
-                action=action,
-                market_context=market_desc,
-                decision=decision,
-                reasoning=reasoning,
-                confidence=confidence,
-                metadata={
-                    "function_calls_count": len(function_calls)
-                }
-            )
-
     def log_trade_completion(
         self,
         trade_id: int,
@@ -95,15 +84,81 @@ class ExperienceManager:
         leverage: float,
         stake_amount: float,
         max_drawdown: float,
-        market_condition: str
+        market_condition: str,
+        position_metrics: Optional[Dict[str, Any]] = None,
+        market_changes: Optional[Dict[str, Any]] = None
     ):
         """
-        记录交易完成
+        记录交易完成（集成 RAG 评价和学习）
 
         Args:
             (参数同trade_logger.log_trade)
+            position_metrics: 持仓指标（可选）
+            market_changes: 市场变化（可选）
         """
-        # 分析交易并提取教训
+        # 【新增】使用 RAG 系统评价和存储交易
+        evaluation = None
+        if self.rag_manager:
+            try:
+                # 尝试从 market_condition 中提取模型评分
+                model_score = None
+                if market_condition and "模型评分" in market_condition:
+                    try:
+                        import re
+                        match = re.search(r'模型评分\s+(\d+(?:\.\d+)?)/100', market_condition)
+                        if match:
+                            model_score = float(match.group(1))
+                            logger.debug(f"提取到模型评分: {model_score}")
+                    except:
+                        pass
+
+                evaluation = self.rag_manager.store_trade_experience(
+                    trade_id=trade_id,
+                    pair=pair,
+                    side=side,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    entry_time=entry_time,
+                    exit_time=exit_time,
+                    profit_pct=profit_pct,
+                    leverage=leverage,
+                    stake_amount=stake_amount,
+                    entry_reason=entry_reason,
+                    exit_reason=exit_reason,
+                    position_metrics=position_metrics,
+                    market_changes=market_changes,
+                    model_score=model_score
+                )
+
+                # 记录到奖励学习系统
+                if evaluation:
+                    decision_context = {
+                        'pair': pair,
+                        'side': side,
+                        'leverage': leverage,
+                        'market_condition': market_condition
+                    }
+                    if position_metrics:
+                        decision_context.update(position_metrics)
+
+                    self.rag_manager.reward_learning.record_reward(
+                        trade_id=trade_id,
+                        pair=pair,
+                        action_type='trade_complete',
+                        decision_context=decision_context,
+                        evaluation=evaluation
+                    )
+
+                    logger.info(
+                        f"✓ 交易已评价并存储到RAG: {pair} | "
+                        f"评分={evaluation.get('total_score', 0):.0f} | "
+                        f"评级={evaluation.get('grade', 'C')}"
+                    )
+
+            except Exception as e:
+                logger.error(f"RAG评价失败: {e}", exc_info=True)
+
+        # 【传统方式】分析交易并提取教训
         lessons = self._analyze_trade(
             pair=pair,
             side=side,
@@ -112,6 +167,12 @@ class ExperienceManager:
             exit_reason=exit_reason,
             max_drawdown=max_drawdown
         )
+
+        # 如果有RAG评价，附加评语
+        if evaluation:
+            comments = evaluation.get('comments', {})
+            if comments.get('suggestions'):
+                lessons += " | RAG建议: " + comments['suggestions'][0]
 
         # 记录到日志
         self.trade_logger.log_trade(
@@ -131,28 +192,6 @@ class ExperienceManager:
             max_drawdown=max_drawdown,
             lessons=lessons
         )
-
-        # 存储到RAG系统
-        if self.rag_manager and self.rag_manager.enabled:
-            duration_minutes = int((exit_time - entry_time).total_seconds() / 60)
-
-            self.rag_manager.store_trade(
-                pair=pair,
-                side=side,
-                entry_reason=entry_reason,
-                exit_reason=exit_reason,
-                profit_pct=profit_pct,
-                duration_minutes=duration_minutes,
-                entry_price=entry_price,
-                exit_price=exit_price,
-                leverage=leverage,
-                market_condition=market_condition,
-                lessons=lessons,
-                metadata={
-                    "trade_id": trade_id,
-                    "max_drawdown": max_drawdown
-                }
-            )
 
         # 更新内存统计
         self._update_pair_performance(pair, profit_pct, side)

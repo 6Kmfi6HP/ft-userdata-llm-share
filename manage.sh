@@ -114,10 +114,11 @@ clean_data() {
     echo -e "${RED}=================================================${NC}"
     echo ""
     echo -e "${YELLOW}警告：此操作将删除以下数据：${NC}"
-    echo "  1. ChromaDB向量数据库 (RAG历史)"
-    echo "  2. 交易数据库 (tradesv3.sqlite)"
-    echo "  3. Freqtrade日志"
-    echo "  4. LLM决策日志"
+    echo "  1. RAG向量存储 (vector_store, 交易经验)"
+    echo "  2. 奖励学习数据 (reward_learning.json)"
+    echo "  3. 交易数据库 (tradesv3.sqlite)"
+    echo "  4. Freqtrade日志"
+    echo "  5. LLM决策日志"
     echo ""
     echo -e "${RED}此操作不可恢复！${NC}"
     echo ""
@@ -138,8 +139,11 @@ clean_data() {
     fi
 
     # 清理文件
-    echo "清理向量数据库..."
-    rm -rf user_data/data/vector_store/*
+    echo "清理 RAG 向量存储..."
+    rm -rf user_data/rag/*
+
+    echo "清理奖励学习数据..."
+    rm -f user_data/logs/reward_learning.json
 
     echo "清理交易数据库..."
     rm -f user_data/tradesv3.sqlite*

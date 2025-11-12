@@ -1,13 +1,13 @@
 """
 LLM Function Calling Strategy
-基于LLM函数调用和RAG的智能交易策略
+基于LLM函数调用的智能交易策略
 
 作者: Claude Code
 版本: 1.0.0
 """
 
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import pandas as pd
 from datetime import datetime
 from freqtrade.strategy import IStrategy, informative, merge_informative_pair
@@ -22,18 +22,20 @@ from llm_modules.llm.function_executor import FunctionExecutor
 from llm_modules.experience.trade_logger import TradeLogger
 from llm_modules.experience.experience_manager import ExperienceManager
 
+# 导入新的指标计算器
+from llm_modules.indicators.indicator_calculator import IndicatorCalculator
+
 # 初始化 logger（必须在使用前定义）
 logger = logging.getLogger(__name__)
 
-# RAG系统相关导入（可选）
-try:
-    from llm_modules.rag.embedding_service import EmbeddingService
-    from llm_modules.rag.vector_store import VectorStore
-    from llm_modules.rag.rag_manager import RAGManager
-    RAG_AVAILABLE = True
-except ImportError:
-    RAG_AVAILABLE = False
-    logger.warning("RAG模块不可用，将在简化模式下运行")
+# 历史上下文系统
+from llm_modules.experience.simple_historical_context import SimpleHistoricalContext
+from llm_modules.experience.trade_reviewer import TradeReviewer
+
+# 增强模块导入
+from llm_modules.utils.position_tracker import PositionTracker
+from llm_modules.utils.market_comparator import MarketStateComparator
+from llm_modules.utils.decision_checker import DecisionQualityChecker
 
 
 class LLMFunctionStrategy(IStrategy):
@@ -50,25 +52,23 @@ class LLMFunctionStrategy(IStrategy):
     # 策略基本配置
     INTERFACE_VERSION = 3
     can_short = True
-    timeframe = '15m'  # 15分钟K线，适合中短线趋势
+    timeframe = '30m'  # 30分钟K线，减少噪音，提高信号质量
 
     # 启动需要的历史数据
-    startup_candle_count = 800  # 15分钟*800 = 约8.3天数据（确保4小时框架EMA50稳定）
+    startup_candle_count = 400  # 30分钟*400 = 约8.3天数据（确保4小时框架EMA50稳定）
 
-    # 止损配置 - 由LLM在exit决策中自己控制
-    stoploss = -0.99  # 极端止损，LLM会在exit决策中主动平仓
-    use_custom_stoploss = False  # 禁用自定义止损，让LLM完全控制
+    # 策略不使用固定止损，由LLM在exit决策中完全控制
+    stoploss = -0.99  # 极端止损，实际由LLM决策平仓
+    use_custom_stoploss = False
 
     # 仓位调整
     position_adjustment_enable = True
     max_entry_position_adjustment = 10
 
-    # 订单类型
+    # 订单类型 - 全部使用市价单
     order_types = {
-        'entry': 'limit',
-        'exit': 'limit',
-        'stoploss': 'market',
-        'stoploss_on_exchange': False,
+        'entry': 'market',
+        'exit': 'market',
     }
 
     def __init__(self, config: dict) -> None:
@@ -83,7 +83,6 @@ class LLMFunctionStrategy(IStrategy):
             # 1. 加载配置
             self.config_loader = ConfigLoader()
             self.llm_config = self.config_loader.get_llm_config()
-            self.rag_config = self.config_loader.get_rag_config()
             self.risk_config = self.config_loader.get_risk_config()
             self.experience_config = self.config_loader.get_experience_config()
             self.context_config = self.config_loader.get_context_config()
@@ -97,26 +96,9 @@ class LLMFunctionStrategy(IStrategy):
             # 4. 初始化交易工具（简化版 - 只保留交易控制工具）
             self.trading_tools = TradingTools(self)
 
-            # 5. 初始化RAG系统（可选）
-            self.rag_manager = None
-            if RAG_AVAILABLE and self.config_loader.is_rag_enabled():
-                try:
-                    embedding_service = EmbeddingService(self.llm_config)
-                    vector_store = VectorStore(
-                        storage_path=self.rag_config.get("storage_path", "./user_data/data/vector_store"),
-                        embedding_service=embedding_service
-                    )
-                    self.rag_manager = RAGManager(
-                        rag_config=self.rag_config,
-                        embedding_service=embedding_service,
-                        vector_store=vector_store
-                    )
-                    logger.info("✓ RAG系统已启用")
-                except Exception as e:
-                    logger.error(f"✗ RAG系统初始化失败: {e}，将继续以简化模式运行")
-                    self.rag_manager = None
-            else:
-                logger.info("✓ RAG系统已禁用，使用简化模式")
+            # 5. 初始化简单历史上下文系统
+            self.historical_context = SimpleHistoricalContext(self.experience_config)
+            logger.info("✓ 简单历史上下文系统已启用")
 
             # 6. 初始化LLM客户端
             self.llm_client = LLMClient(self.llm_config, self.function_executor)
@@ -126,6 +108,26 @@ class LLMFunctionStrategy(IStrategy):
 
             # 8. 初始化经验系统
             self.trade_logger = TradeLogger(self.experience_config)
+
+            # 9. 初始化 RAG 系统（可选）
+            self.rag_manager = None
+            if self.experience_config.get("enable_rag", False):
+                try:
+                    from llm_modules.learning.rag_manager import RAGManager
+                    rag_config = self.experience_config.get("rag_config", {})
+                    self.rag_manager = RAGManager(rag_config)
+                    logger.info("✓ RAG 学习系统已启用")
+                except Exception as e:
+                    logger.warning(f"RAG 系统初始化失败（将使用传统模式）: {e}")
+
+            # 将 RAG 管理器设置到 trading_tools
+            self.trading_tools.rag_manager = self.rag_manager
+
+            # 重新注册工具函数（使RAG函数可用）
+            if self.rag_manager:
+                self._register_all_tools()
+                logger.info("✓ RAG 工具函数已注册")
+
             self.experience_manager = ExperienceManager(
                 trade_logger=self.trade_logger,
                 rag_manager=self.rag_manager
@@ -133,24 +135,47 @@ class LLMFunctionStrategy(IStrategy):
 
             # 10. 缓存
             self._leverage_cache = {}
-            self._stoploss_cache = {}
             self._position_adjustment_cache = {}
-            self._entry_price_cache = {}
-            self._exit_price_cache = {}
+            self._stake_request_cache = {}
+            self._model_score_cache = {}  # 存储模型对交易的自我评分
 
-            # 11. 系统提示词
-            self.system_prompt = self.context_builder.build_system_prompt()
+            # 11. 初始化增强模块
+            self.position_tracker = PositionTracker()
+            self.market_comparator = MarketStateComparator()
+            self.decision_checker = DecisionQualityChecker()
+            self.trade_reviewer = TradeReviewer()
+            logger.info("✓ 增强模块已初始化 (PositionTracker, MarketStateComparator, DecisionChecker, TradeReviewer)")
+
+            # 12. 系统提示词（两套：开仓和持仓）
+            self.entry_system_prompt = self.context_builder.build_entry_system_prompt()
+            self.position_system_prompt = self.context_builder.build_position_system_prompt()
+            logger.info("✓ 已加载两套系统提示词（开仓/持仓管理）")
 
             logger.info("✓ 策略初始化完成")
             logger.info(f"  - LLM模型: {self.llm_config.get('model')}")
             logger.info(f"  - 交易工具已注册: {len(self.function_executor.list_functions())} 个")
-            logger.info(f"  - RAG系统: {'启用' if self.rag_manager else '禁用'}")
+            logger.info(f"  - 历史上下文系统: 已启用（简单JSONL模式）")
             logger.info(f"  - 模式: 简化版（市场数据已内置在context中）")
             logger.info("=" * 60)
 
         except Exception as e:
             logger.error(f"策略初始化失败: {e}", exc_info=True)
             raise
+
+    def _get_system_prompt(self, has_position: bool) -> str:
+        """
+        根据是否有仓位选择系统提示词
+
+        Args:
+            has_position: 是否有仓位
+
+        Returns:
+            对应的系统提示词
+        """
+        if has_position:
+            return self.position_system_prompt
+        else:
+            return self.entry_system_prompt
 
     def _register_all_tools(self):
         """注册所有工具函数（简化版 - 只注册交易控制工具）"""
@@ -162,6 +187,70 @@ class LLMFunctionStrategy(IStrategy):
             )
             logger.debug(f"已注册 {len(self.trading_tools.get_tools_schema())} 个交易控制函数")
 
+    def _collect_multi_timeframe_history(self, pair: str) -> Dict[str, pd.DataFrame]:
+        """根据ContextBuilder配置获取多时间框架K线数据"""
+        if not getattr(self.context_builder, 'include_multi_timeframe_data', True):
+            return {}
+
+        if not hasattr(self, 'dp') or not self.dp:
+            return {}
+
+        if not hasattr(self.context_builder, 'get_multi_timeframe_history_config'):
+            return {}
+
+        tf_config = self.context_builder.get_multi_timeframe_history_config()
+        if not tf_config:
+            return {}
+
+        history: Dict[str, pd.DataFrame] = {}
+
+        for timeframe, cfg in tf_config.items():
+            candles = cfg.get('candles', 0)
+            fields = cfg.get('fields', [])
+            tf_df = self._fetch_timeframe_dataframe(pair, timeframe, candles, fields)
+            if tf_df is not None and not tf_df.empty:
+                history[timeframe] = tf_df
+
+        return history
+
+    def _fetch_timeframe_dataframe(
+        self,
+        pair: str,
+        timeframe: str,
+        candles: int,
+        fields: List[str]
+    ) -> Optional[pd.DataFrame]:
+        if candles <= 0:
+            return None
+
+        try:
+            raw_df = self.dp.get_pair_dataframe(pair=pair, timeframe=timeframe)
+        except Exception as e:
+            logger.warning(f"获取{timeframe}数据失败: {e}")
+            return None
+
+        if raw_df is None or raw_df.empty:
+            return None
+
+        padding = max(candles + 100, 200)
+        df = raw_df.tail(padding).copy()
+
+        self._append_indicator_columns(df, fields)
+
+        return df.tail(candles)
+
+    def _append_indicator_columns(self, dataframe: pd.DataFrame, fields: List[str]):
+        """
+        在给定dataframe上补齐所需指标列
+        使用统一的 IndicatorCalculator 简化逻辑
+        """
+        if not fields:
+            return
+
+        # 简单粗暴：直接添加所有指标（IndicatorCalculator会跳过已存在的列）
+        # 这比之前的逐个判断更简洁，且计算成本可忽略
+        IndicatorCalculator.add_all_indicators(dataframe)
+
     def bot_start(self, **kwargs) -> None:
         """
         策略启动时调用（此时dp和wallets已初始化）
@@ -169,38 +258,202 @@ class LLMFunctionStrategy(IStrategy):
         logger.info("✓ Bot已启动，策略运行中...")
         logger.info(f"✓ 交易工具: {len(self.function_executor.list_functions())} 个函数可用")
 
+    def confirm_trade_entry(
+        self,
+        pair: str,
+        order_type: str,
+        amount: float,
+        rate: float,
+        time_in_force: str,
+        current_time: datetime,
+        entry_tag: Optional[str],
+        side: str,
+        **kwargs
+    ) -> bool:
+        """
+        开仓确认回调 - 保存市场状态到 MarketComparator
+
+        注意：此时 trade 对象还未创建，无法获取 trade_id
+        暂时先获取技术指标，等 trade 创建后再关联
+        """
+        try:
+            # 获取最新的dataframe
+            dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+            if dataframe.empty:
+                return True
+
+            latest = dataframe.iloc[-1]
+
+            # 提取技术指标
+            indicators = {
+                'atr': latest.get('atr', 0),
+                'rsi': latest.get('rsi', 50),
+                'ema_20': latest.get('ema_20', 0),
+                'ema_50': latest.get('ema_50', 0),
+                'macd': latest.get('macd', 0),
+                'macd_signal': latest.get('macd_signal', 0),
+                'adx': latest.get('adx', 0)
+            }
+
+            # 暂存开仓信息（将在下一次 populate 中关联 trade_id）
+            # 使用 pair+rate 作为临时key
+            temp_key = f"{pair}_{rate}"
+            self._pending_entry_states = getattr(self, '_pending_entry_states', {})
+            self._pending_entry_states[temp_key] = {
+                'pair': pair,
+                'rate': rate,
+                'indicators': indicators,
+                'entry_tag': entry_tag or '',
+                'side': side,
+                'time': current_time
+            }
+
+            logger.debug(f"开仓确认: {pair} @ {rate}, 等待trade_id关联")
+
+        except Exception as e:
+            logger.error(f"confirm_trade_entry 失败: {e}")
+
+        return True
+
+    def confirm_trade_exit(
+        self,
+        pair: str,
+        trade: Any,
+        order_type: str,
+        amount: float,
+        rate: float,
+        time_in_force: str,
+        exit_reason: str,
+        current_time: datetime,
+        **kwargs
+    ) -> bool:
+        """
+        平仓确认回调 - 生成交易复盘并存储到 RAG
+        """
+        try:
+            # 获取持仓追踪数据
+            position_metrics = self.position_tracker.get_position_metrics(trade.id)
+
+            # 获取市场状态变化
+            dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+            if not dataframe.empty:
+                latest = dataframe.iloc[-1]
+                current_indicators = {
+                    'atr': latest.get('atr', 0),
+                    'rsi': latest.get('rsi', 50),
+                    'ema_20': latest.get('ema_20', 0),
+                    'ema_50': latest.get('ema_50', 0),
+                    'macd': latest.get('macd', 0),
+                    'adx': latest.get('adx', 0)
+                }
+                market_changes = self.market_comparator.compare_with_entry(
+                    trade_id=trade.id,
+                    current_price=rate,
+                    current_indicators=current_indicators
+                )
+            else:
+                market_changes = {}
+
+            # 手动计算盈亏百分比（因为此时 trade.close_profit 可能为 None）
+            if trade.is_short:
+                profit_pct = (trade.open_rate - rate) / trade.open_rate * trade.leverage * 100
+            else:
+                profit_pct = (rate - trade.open_rate) / trade.open_rate * trade.leverage * 100
+
+            # 计算持仓时长（处理时区兼容性）
+            # freqtrade使用naive UTC时间，根据是否有tzinfo选择对应的now
+            from datetime import timezone
+            if trade.open_date.tzinfo is None:
+                # trade.open_date 是 naive，current_time 也应该是 naive
+                exit_time = current_time.replace(tzinfo=None) if current_time.tzinfo else current_time
+            else:
+                # trade.open_date 是 aware，current_time 也应该是 aware
+                exit_time = current_time if current_time.tzinfo else current_time.replace(tzinfo=timezone.utc)
+
+            duration_minutes = int((exit_time - trade.open_date).total_seconds() / 60)
+
+            # 生成交易复盘（如果 TradeReviewer 可用）
+            if self.trade_reviewer:
+                review = self.trade_reviewer.generate_trade_review(
+                    pair=pair,
+                    side='short' if trade.is_short else 'long',
+                    entry_price=trade.open_rate,
+                    exit_price=rate,
+                    entry_reason=getattr(trade, 'enter_tag', '') or '',
+                    exit_reason=exit_reason,
+                    profit_pct=profit_pct,
+                    duration_minutes=duration_minutes,
+                    leverage=trade.leverage,
+                    position_metrics=position_metrics,
+                    market_changes=market_changes
+                )
+
+                # 输出复盘报告
+                report = self.trade_reviewer.format_review_report(review)
+                logger.info(f"\n{report}")
+
+            # 记录交易到历史日志（供未来决策参考）
+            if self.experience_manager:
+
+                # 格式化持仓时间
+                if duration_minutes < 60:
+                    duration_str = f"{duration_minutes}分钟"
+                elif duration_minutes < 1440:
+                    duration_str = f"{duration_minutes / 60:.1f}小时"
+                else:
+                    duration_str = f"{duration_minutes / 1440:.1f}天"
+
+                # 记录交易
+                max_loss_pct = position_metrics.get('max_loss_pct', 0) if position_metrics else 0
+                max_profit_pct = position_metrics.get('max_profit_pct', 0) if position_metrics else 0
+
+                # 获取模型评分
+                model_score = self._model_score_cache.pop(pair, None)
+                model_score_str = f"模型评分 {model_score:.0f}/100" if model_score else ""
+                market_condition = f"MFE {max_profit_pct:+.2f}% / MAE {max_loss_pct:+.2f}% / 持仓 {duration_str} / {model_score_str}"
+
+                self.experience_manager.log_trade_completion(
+                    trade_id=trade.id,
+                    pair=pair,
+                    side='short' if trade.is_short else 'long',
+                    entry_time=trade.open_date,
+                    entry_price=trade.open_rate,
+                    entry_reason=getattr(trade, 'enter_tag', '') or '未记录',
+                    exit_time=exit_time,
+                    exit_price=rate,
+                    exit_reason=exit_reason,
+                    profit_pct=profit_pct,
+                    profit_abs=trade.stake_amount * profit_pct / 100,
+                    leverage=trade.leverage,
+                    stake_amount=trade.stake_amount,
+                    max_drawdown=max_loss_pct,
+                    market_condition=market_condition,
+                    position_metrics=position_metrics,  # 【新增】传递持仓指标
+                    market_changes=market_changes      # 【新增】传递市场变化
+                )
+                logger.info(f"✓ 交易 {trade.id} 已记录到历史日志")
+
+            # 清理追踪数据
+            if trade.id in self.position_tracker.positions:
+                del self.position_tracker.positions[trade.id]
+            if trade.id in self.market_comparator.entry_states:
+                del self.market_comparator.entry_states[trade.id]
+
+        except Exception as e:
+            logger.error(f"生成交易复盘失败: {e}", exc_info=True)
+
+        return True
+
     # 多时间框架数据支持
     @informative('1h')
     def populate_indicators_1h(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
-        """1小时数据指标"""
-        dataframe['ema_20'] = ta.EMA(dataframe, timeperiod=20)
-        dataframe['ema_50'] = ta.EMA(dataframe, timeperiod=50)
-        dataframe['rsi'] = ta.RSI(dataframe, timeperiod=14)
-        macd = ta.MACD(dataframe)
-        dataframe['macd'] = macd['macd']
-        dataframe['macd_signal'] = macd['macdsignal']
-        bollinger = ta.BBANDS(dataframe, timeperiod=20)
-        dataframe['bb_upper'] = bollinger['upperband']
-        dataframe['bb_lower'] = bollinger['lowerband']
-        dataframe['atr'] = ta.ATR(dataframe, timeperiod=14)
-        dataframe['adx'] = ta.ADX(dataframe, timeperiod=14)
-        return dataframe
+        """1小时数据指标 - 使用统一的 IndicatorCalculator"""
+        return IndicatorCalculator.add_all_indicators(dataframe)
 
     @informative('4h')
     def populate_indicators_4h(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
-        """4小时数据指标"""
-        dataframe['ema_20'] = ta.EMA(dataframe, timeperiod=20)
-        dataframe['ema_50'] = ta.EMA(dataframe, timeperiod=50)
-        dataframe['rsi'] = ta.RSI(dataframe, timeperiod=14)
-        macd = ta.MACD(dataframe)
-        dataframe['macd'] = macd['macd']
-        dataframe['macd_signal'] = macd['macdsignal']
-        bollinger = ta.BBANDS(dataframe, timeperiod=20)
-        dataframe['bb_upper'] = bollinger['upperband']
-        dataframe['bb_lower'] = bollinger['lowerband']
-        dataframe['atr'] = ta.ATR(dataframe, timeperiod=14)
-        dataframe['adx'] = ta.ADX(dataframe, timeperiod=14)
-        return dataframe
+        """4小时数据指标 - 使用统一的 IndicatorCalculator"""
+        return IndicatorCalculator.add_all_indicators(dataframe)
 
     @informative('1d')
     def populate_indicators_1d(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
@@ -221,37 +474,9 @@ class LLMFunctionStrategy(IStrategy):
 
     def populate_indicators(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
         """
-        计算技术指标（15分钟基础数据）
+        计算技术指标（30分钟基础数据）- 使用统一的 IndicatorCalculator
         """
-        # 趋势指标
-        dataframe['ema_20'] = ta.EMA(dataframe, timeperiod=20)
-        dataframe['ema_50'] = ta.EMA(dataframe, timeperiod=50)
-        dataframe['ema_100'] = ta.EMA(dataframe, timeperiod=100)  # 用EMA100代替EMA200，更适合15分钟框架
-
-        # 动量指标
-        dataframe['rsi'] = ta.RSI(dataframe, timeperiod=14)
-
-        macd = ta.MACD(dataframe)
-        dataframe['macd'] = macd['macd']
-        dataframe['macd_signal'] = macd['macdsignal']
-        dataframe['macd_hist'] = macd['macdhist']
-
-        # 波动率指标
-        bollinger = ta.BBANDS(dataframe, timeperiod=20)
-        dataframe['bb_upper'] = bollinger['upperband']
-        dataframe['bb_middle'] = bollinger['middleband']
-        dataframe['bb_lower'] = bollinger['lowerband']
-
-        dataframe['atr'] = ta.ATR(dataframe, timeperiod=14)
-
-        # 趋势强度
-        dataframe['adx'] = ta.ADX(dataframe, timeperiod=14)
-
-        # 成交量指标
-        dataframe['mfi'] = ta.MFI(dataframe, timeperiod=14)
-        dataframe['obv'] = ta.OBV(dataframe)
-
-        return dataframe
+        return IndicatorCalculator.add_all_indicators(dataframe)
 
     def populate_entry_trend(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
         """
@@ -282,39 +507,40 @@ class LLMFunctionStrategy(IStrategy):
                 elif hasattr(self.dp, 'exchange'):
                     exchange = self.dp.exchange
 
+            multi_tf_history = (
+                self._collect_multi_timeframe_history(pair)
+                if getattr(self.context_builder, 'include_multi_timeframe_data', True)
+                else {}
+            )
+
             market_context = self.context_builder.build_market_context(
                 dataframe=dataframe,
                 metadata=metadata,
                 wallets=self.wallets,
                 current_trades=current_trades,
                 exchange=exchange,
-                stoploss_cache=self._stoploss_cache
+                position_tracker=self.position_tracker,
+                market_comparator=self.market_comparator,
+                multi_timeframe_data=multi_tf_history
             )
 
-            # 检索相似的历史情况（如果RAG可用）
-            rag_context = ""
-            if self.rag_manager:
-                try:
-                    rag_context = self.rag_manager.get_relevant_context(
-                        pair=pair,
-                        current_state=market_context,
-                        action_type="entry"
-                    )
-                except Exception as e:
-                    logger.warning(f"RAG检索失败: {e}")
-                    rag_context = ""
+            # 获取历史交易上下文
+            historical_context = self.historical_context.get_recent_context(
+                pair=pair,
+                action_type="entry"
+            )
 
             # 构建决策请求
             decision_request = self.context_builder.build_decision_request(
                 action_type="entry",
                 market_context=market_context,
                 position_context="",  # 已包含在market_context中
-                rag_context=rag_context
+                historical_context=historical_context
             )
 
-            # 调用LLM决策
+            # 调用LLM决策（使用开仓提示词）
             messages = [
-                {"role": "system", "content": self.system_prompt},
+                {"role": "system", "content": self._get_system_prompt(has_position=False)},
                 {"role": "user", "content": decision_request}
             ]
 
@@ -348,7 +574,6 @@ class LLMFunctionStrategy(IStrategy):
                 if signal:
                     action = signal.get("action")
                     reason = signal.get("reason", llm_message)
-                    limit_price = signal.get("limit_price")
 
                     # 提取新增参数
                     confidence_score = signal.get("confidence_score", 0)
@@ -356,25 +581,23 @@ class LLMFunctionStrategy(IStrategy):
                     key_resistance = signal.get("key_resistance", 0)
                     rsi_value = signal.get("rsi_value", 0)
                     trend_strength = signal.get("trend_strength", "未知")
+                    stake_amount = signal.get("stake_amount")
+
+                    if stake_amount and stake_amount > 0:
+                        self._stake_request_cache[pair] = stake_amount
 
                     if action == "enter_long":
-                        # 缓存挂单价格
-                        if limit_price:
-                            self._entry_price_cache[pair] = limit_price
                         dataframe.loc[dataframe.index[-1], 'enter_long'] = 1
                         dataframe.loc[dataframe.index[-1], 'enter_tag'] = reason
                         logger.info(f"📈 {pair} | 做多 | 置信度: {confidence_score}")
-                        logger.info(f"   挂单价: {limit_price} | 支撑: {key_support} | 阻力: {key_resistance}")
+                        logger.info(f"   支撑: {key_support} | 阻力: {key_resistance}")
                         logger.info(f"   RSI: {rsi_value} | 趋势强度: {trend_strength}")
                         logger.info(f"   理由: {reason}")
                     elif action == "enter_short":
-                        # 缓存挂单价格
-                        if limit_price:
-                            self._entry_price_cache[pair] = limit_price
                         dataframe.loc[dataframe.index[-1], 'enter_short'] = 1
                         dataframe.loc[dataframe.index[-1], 'enter_tag'] = reason
                         logger.info(f"📉 {pair} | 做空 | 置信度: {confidence_score}")
-                        logger.info(f"   挂单价: {limit_price} | 支撑: {key_support} | 阻力: {key_resistance}")
+                        logger.info(f"   支撑: {key_support} | 阻力: {key_resistance}")
                         logger.info(f"   RSI: {rsi_value} | 趋势强度: {trend_strength}")
                         logger.info(f"   理由: {reason}")
                     elif action == "hold":
@@ -429,38 +652,85 @@ class LLMFunctionStrategy(IStrategy):
                 elif hasattr(self.dp, 'exchange'):
                     exchange = self.dp.exchange
 
+            multi_tf_history = (
+                self._collect_multi_timeframe_history(pair)
+                if getattr(self.context_builder, 'include_multi_timeframe_data', True)
+                else {}
+            )
+
             market_context = self.context_builder.build_market_context(
                 dataframe=dataframe,
                 metadata=metadata,
                 wallets=self.wallets,
                 current_trades=current_trades,
                 exchange=exchange,
-                stoploss_cache=self._stoploss_cache
+                position_tracker=self.position_tracker,
+                market_comparator=self.market_comparator,
+                multi_timeframe_data=multi_tf_history
             )
 
-            # 检索相似的历史情况（如果RAG可用）
-            rag_context = ""
-            if self.rag_manager:
+            # 更新 PositionTracker 和关联 MarketComparator
+            pair_trades = [t for t in current_trades if t.pair == pair]
+
+            # 检查dataframe是否为空
+            if dataframe.empty:
+                logger.warning(f"{pair} dataframe为空，跳过持仓追踪更新")
+                return dataframe
+
+            current_price = dataframe.iloc[-1]['close']
+
+            for trade in pair_trades:
                 try:
-                    rag_context = self.rag_manager.get_relevant_context(
+                    # 更新持仓追踪数据
+                    self.position_tracker.update_position(
+                        trade_id=trade.id,
                         pair=pair,
-                        current_state=market_context,
-                        action_type="exit"
+                        current_price=current_price,
+                        open_price=trade.open_rate,
+                        is_short=trade.is_short,
+                        leverage=trade.leverage,
+                        decision_type='check',  # 正在检查是否平仓
+                        decision_reason=''  # 稍后在决策后更新
                     )
+
+                    # 关联待定的开仓状态（如果存在）
+                    temp_key = f"{pair}_{trade.open_rate}"
+                    if hasattr(self, '_pending_entry_states') and temp_key in self._pending_entry_states:
+                        pending = self._pending_entry_states[temp_key]
+                        # 保存到 MarketComparator
+                        self.market_comparator.save_entry_state(
+                            trade_id=trade.id,
+                            pair=pair,
+                            price=trade.open_rate,
+                            indicators=pending['indicators'],
+                            entry_reason=pending['entry_tag'],
+                            trend_alignment='',
+                            market_sentiment=''
+                        )
+                        # 清除待定状态
+                        del self._pending_entry_states[temp_key]
+                        logger.debug(f"已关联开仓状态到 trade_id={trade.id}")
+
                 except Exception as e:
-                    logger.warning(f"RAG检索失败: {e}")
-                    rag_context = ""
+                    logger.debug(f"更新持仓追踪失败: {e}")
+
+            # 获取历史交易上下文
+            historical_context = self.historical_context.get_recent_context(
+                pair=pair,
+                action_type="exit"
+            )
 
             # 构建决策请求
             decision_request = self.context_builder.build_decision_request(
                 action_type="exit",
                 market_context=market_context,
                 position_context="",  # 已包含在market_context中
-                rag_context=rag_context
+                historical_context=historical_context
             )
 
+            # 调用LLM决策（使用持仓管理提示词）
             messages = [
-                {"role": "system", "content": self.system_prompt},
+                {"role": "system", "content": self._get_system_prompt(has_position=True)},
                 {"role": "user", "content": decision_request}
             ]
 
@@ -474,24 +744,117 @@ class LLMFunctionStrategy(IStrategy):
                 signal = self.trading_tools.get_signal(pair)
                 if signal and signal.get("action") == "exit":
                     reason = signal.get("reason", llm_message)
-                    limit_price = signal.get("limit_price")
 
                     # 提取新增参数
                     confidence_score = signal.get("confidence_score", 0)
                     rsi_value = signal.get("rsi_value", 0)
+                    trade_score = signal.get("trade_score", None)  # 模型自我评分
 
-                    # 缓存挂单价格
-                    if limit_price:
-                        self._exit_price_cache[pair] = limit_price
+                    # 缓存模型评分（在 confirm_trade_exit 中使用）
+                    if trade_score is not None:
+                        self._model_score_cache[pair] = trade_score
 
                     dataframe.loc[dataframe.index[-1], 'exit_long'] = 1
                     dataframe.loc[dataframe.index[-1], 'exit_short'] = 1
                     dataframe.loc[dataframe.index[-1], 'exit_tag'] = reason
-                    logger.info(f"🔚 {pair} | 平仓 | 置信度: {confidence_score} | 挂单价: {limit_price}")
+                    logger.info(f"🔚 {pair} | 平仓 | 置信度: {confidence_score} | 自我评分: {trade_score}/100")
                     logger.info(f"   RSI: {rsi_value}")
                     logger.info(f"   理由: {reason}")
+
+                    # 【立即生成交易复盘】- 在平仓信号发出时
+                    if pair_trades and self.trade_reviewer:
+                        try:
+                            trade = pair_trades[0]
+
+                            # 获取持仓追踪数据
+                            position_metrics = self.position_tracker.get_position_metrics(trade.id)
+
+                            # 获取市场状态变化
+                            latest = dataframe.iloc[-1]
+                            current_indicators = {
+                                'atr': latest.get('atr', 0),
+                                'rsi': latest.get('rsi', 50),
+                                'ema_20': latest.get('ema_20', 0),
+                                'ema_50': latest.get('ema_50', 0),
+                                'macd': latest.get('macd', 0),
+                                'adx': latest.get('adx', 0)
+                            }
+                            market_changes = self.market_comparator.compare_with_entry(
+                                trade_id=trade.id,
+                                current_price=current_price,
+                                current_indicators=current_indicators
+                            )
+
+                            # 计算持仓时长（分钟）
+                            from datetime import datetime, timezone
+                            now = datetime.utcnow() if trade.open_date.tzinfo is None else datetime.now(timezone.utc)
+                            duration_minutes = int((now - trade.open_date).total_seconds() / 60)
+
+                            # 计算预期平仓盈亏（使用当前市价）
+                            exit_price = current_price
+                            if trade.is_short:
+                                profit_pct = (trade.open_rate - exit_price) / trade.open_rate * trade.leverage * 100
+                            else:
+                                profit_pct = (exit_price - trade.open_rate) / trade.open_rate * trade.leverage * 100
+
+                            # 生成交易复盘
+                            review = self.trade_reviewer.generate_trade_review(
+                                pair=pair,
+                                side='short' if trade.is_short else 'long',
+                                entry_price=trade.open_rate,
+                                exit_price=exit_price,
+                                entry_reason=getattr(trade, 'enter_tag', '') or '',
+                                exit_reason=reason,
+                                profit_pct=profit_pct,
+                                duration_minutes=duration_minutes,
+                                leverage=trade.leverage,
+                                position_metrics=position_metrics,
+                                market_changes=market_changes
+                            )
+
+                            # 输出复盘报告
+                            report = self.trade_reviewer.format_review_report(review)
+                            logger.info(f"\n{report}")
+
+                        except Exception as e:
+                            logger.error(f"生成交易复盘失败: {e}", exc_info=True)
+
                 else:
                     logger.info(f"💎 {pair} | 继续持有\n{llm_message}")
+
+                # 记录决策到 DecisionChecker（用于检测重复模式和盈利回撤）
+                if signal:
+                    action = signal.get("action")
+                    reason = signal.get("reason", llm_message)
+
+                    # 计算当前盈亏（用于决策质量分析）
+                    if pair_trades:
+                        trade = pair_trades[0]
+                        if trade.is_short:
+                            profit_pct = (trade.open_rate - current_price) / trade.open_rate * trade.leverage * 100
+                        else:
+                            profit_pct = (current_price - trade.open_rate) / trade.open_rate * trade.leverage * 100
+
+                        # 记录决策
+                        decision_type = 'exit' if action == 'exit' else 'hold'
+                        try:
+                            quality_check = self.decision_checker.record_decision(
+                                pair=pair,
+                                decision_type=decision_type,
+                                reason=reason,
+                                profit_pct=profit_pct
+                            )
+
+                            # 如果有警告，记录到日志（不阻止交易）
+                            if quality_check.get('warnings'):
+                                for warning in quality_check['warnings']:
+                                    if warning.get('level') == 'high':
+                                        logger.warning(f"[决策质量警告] {warning.get('message')}")
+                                        if warning.get('suggestion'):
+                                            logger.warning(f"  建议: {warning.get('suggestion')}")
+
+                        except Exception as e:
+                            logger.debug(f"决策质量检查失败: {e}")
 
                 self.trading_tools.clear_signals()
 
@@ -524,21 +887,6 @@ class LLMFunctionStrategy(IStrategy):
         default_leverage = self.risk_config.get("default_leverage", 10)
         return min(default_leverage, max_leverage)
 
-    def custom_stoploss(
-        self,
-        pair: str,
-        trade: Any,
-        current_time: datetime,
-        current_rate: float,
-        current_profit: float,
-        after_fill: bool,
-        **kwargs
-    ) -> Optional[float]:
-        """
-        止损由LLM在exit决策中完全控制，此函数不再使用
-        """
-        return None  # 返回None让Freqtrade使用策略设置的stoploss (-0.99)
-
     def custom_stake_amount(
         self,
         pair: str,
@@ -555,69 +903,23 @@ class LLMFunctionStrategy(IStrategy):
         """
         动态仓位大小 - 可由LLM调整
         """
-        # 使用默认的stake amount
-        return proposed_stake
+        stake_request = None
+        if hasattr(self, '_stake_request_cache'):
+            stake_request = self._stake_request_cache.pop(pair, None)
 
-    def custom_entry_price(
-        self,
-        pair: str,
-        current_time: datetime,
-        proposed_rate: float,
-        entry_tag: Optional[str],
-        side: str,
-        **kwargs
-    ) -> float:
-        """
-        自定义入场价格 - 允许LLM指定挂单价格
+        if stake_request is None:
+            return proposed_stake
 
-        Args:
-            pair: 交易对
-            proposed_rate: freqtrade建议的价格
-            其他参数...
+        desired = stake_request
+        if max_stake:
+            desired = min(desired, max_stake)
 
-        Returns:
-            入场价格
-        """
-        # 检查LLM是否指定了挂单价格
-        if pair in self._entry_price_cache:
-            price = self._entry_price_cache[pair]
-            del self._entry_price_cache[pair]
-            logger.info(f"{pair} 使用LLM指定的入场价格: {price}")
-            return price
+        if min_stake and desired < min_stake:
+            logger.warning(f"{pair} 指定投入 {stake_request:.2f} USDT 低于最小要求 {min_stake:.2f}，已调整为最小值")
+            desired = min_stake
 
-        # 使用默认价格
-        return proposed_rate
-
-    def custom_exit_price(
-        self,
-        pair: str,
-        trade: Any,
-        current_time: datetime,
-        proposed_rate: float,
-        current_profit: float,
-        exit_tag: Optional[str],
-        **kwargs
-    ) -> float:
-        """
-        自定义出场价格 - 允许LLM指定挂单价格
-
-        Args:
-            pair: 交易对
-            proposed_rate: freqtrade建议的价格
-            其他参数...
-
-        Returns:
-            出场价格
-        """
-        # 检查LLM是否指定了挂单价格
-        if pair in self._exit_price_cache:
-            price = self._exit_price_cache[pair]
-            del self._exit_price_cache[pair]
-            logger.info(f"{pair} 使用LLM指定的出场价格: {price}")
-            return price
-
-        # 使用默认价格
-        return proposed_rate
+        logger.info(f"{pair} 使用LLM指定仓位: {desired:.2f} USDT (请求 {stake_request:.2f})")
+        return desired
 
     def adjust_trade_position(
         self,
@@ -652,7 +954,6 @@ class LLMFunctionStrategy(IStrategy):
             del self._position_adjustment_cache[pair]
 
             adjustment_pct = adjustment_info.get("adjustment_pct", 0)
-            limit_price = adjustment_info.get("limit_price")
             reason = adjustment_info.get("reason", "")
 
             # 计算调整金额
@@ -666,11 +967,7 @@ class LLMFunctionStrategy(IStrategy):
                     logger.warning(f"{pair} 加仓金额 {adjustment_stake} 低于最小stake {min_stake}")
                     return None
 
-                # 缓存挂单价格（用于加仓订单）
-                if limit_price:
-                    self._entry_price_cache[pair] = limit_price
-
-                logger.info(f"{pair} 加仓 {adjustment_pct:.1f}% = {adjustment_stake:.2f} USDT | 挂单价: {limit_price} | {reason}")
+                logger.info(f"{pair} 加仓 {adjustment_pct:.1f}% = {adjustment_stake:.2f} USDT | {reason}")
                 return adjustment_stake
 
             elif adjustment_pct < 0:
@@ -678,11 +975,7 @@ class LLMFunctionStrategy(IStrategy):
                 max_reduce = -current_stake * 0.99  # 最多减99%（保留一点避免完全平仓）
                 adjustment_stake = max(adjustment_stake, max_reduce)
 
-                # 缓存挂单价格（用于减仓订单）
-                if limit_price:
-                    self._exit_price_cache[pair] = limit_price
-
-                logger.info(f"{pair} 减仓 {abs(adjustment_pct):.1f}% = {adjustment_stake:.2f} USDT | 挂单价: {limit_price} | {reason}")
+                logger.info(f"{pair} 减仓 {abs(adjustment_pct):.1f}% = {adjustment_stake:.2f} USDT | {reason}")
                 return adjustment_stake
 
         # 无调整
