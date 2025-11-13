@@ -13,15 +13,23 @@ logger = logging.getLogger(__name__)
 class ConfigLoader:
     """配置加载和验证器"""
 
-    def __init__(self, config_path: Optional[str] = None):
+    def __init__(self, config_path: Optional[str] = None, config_dict: Optional[Dict[str, Any]] = None):
         """
         初始化配置加载器
 
         Args:
             config_path: 配置文件路径，如果为None则使用默认路径
+            config_dict: 配置字典，如果提供则直接使用而不从文件加载
         """
-        self.config_path = config_path or self._get_default_config_path()
-        self.config = self._load_config()
+        if config_dict is not None:
+            # 直接使用提供的配置字典
+            self.config_path = "from_dict"
+            self.config = config_dict
+            logger.info("配置已从提供的字典加载")
+        else:
+            # 从文件加载配置
+            self.config_path = config_path or self._get_default_config_path()
+            self.config = self._load_config()
         self._validate_config()
 
     def _get_default_config_path(self) -> str:

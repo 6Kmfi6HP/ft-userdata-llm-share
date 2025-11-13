@@ -227,7 +227,13 @@ class SimpleHistoricalContext:
         # 添加教训和警告
         lessons = trade.get('lessons', {})
 
-        if lessons:
+        # 兼容处理字符串和字典两种格式
+        if isinstance(lessons, str):
+            # 字符串格式：直接显示
+            if lessons:
+                lines.append(f"    【经验】{lessons}")
+        elif isinstance(lessons, dict):
+            # 字典格式：提取 warnings 和 insights
             warnings = lessons.get('warnings', [])
             insights = lessons.get('insights', [])
 

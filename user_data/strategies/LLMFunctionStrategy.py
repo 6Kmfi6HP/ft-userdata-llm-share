@@ -80,8 +80,8 @@ class LLMFunctionStrategy(IStrategy):
         logger.info("=" * 60)
 
         try:
-            # 1. 加载配置
-            self.config_loader = ConfigLoader()
+            # 1. 加载配置 - 使用freqtrade传递的配置字典
+            self.config_loader = ConfigLoader(config_dict=config)
             self.llm_config = self.config_loader.get_llm_config()
             self.risk_config = self.config_loader.get_risk_config()
             self.experience_config = self.config_loader.get_experience_config()

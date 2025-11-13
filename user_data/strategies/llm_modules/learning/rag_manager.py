@@ -36,6 +36,7 @@ class RAGManager:
         self.embedding_service = EmbeddingService(
             model_name=embedding_config.get('model_name', 'text-embedding-bge-m3'),
             api_url=embedding_config.get('api_url', 'http://localhost:11434'),
+            api_key=embedding_config.get('api_key'),
             api_type=embedding_config.get('api_type', 'ollama'),
             dimension=embedding_config.get('dimension', 1024)
         )

@@ -174,13 +174,16 @@ class EmbeddingService:
                 }
 
                 # 尝试标准OpenAI路径 /v1/embeddings 和简化路径 /embeddings
-                api_paths = ["/v1/embeddings", "/embeddings"]
+                # 智能判断：如果 base_url 已经包含 /v1，则不再添加
+                base_url = self.api_url.rstrip('/')
+                if base_url.endswith('/v1'):
+                    api_paths = ["/embeddings"]  # 只尝试 /embeddings
+                else:
+                    api_paths = ["/v1/embeddings", "/embeddings"]
                 success = False
 
                 for api_path in api_paths:
                     try:
-                        # 确保api_url不以/结尾
-                        base_url = self.api_url.rstrip('/')
                         response = requests.post(
                             f"{base_url}{api_path}",
                             json=payload,
