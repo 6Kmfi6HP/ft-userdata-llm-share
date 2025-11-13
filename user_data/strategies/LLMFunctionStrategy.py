@@ -91,6 +91,7 @@ class LLMFunctionStrategy(IStrategy):
             self.risk_config = self.config_loader.get_risk_config()
             self.experience_config = self.config_loader.get_experience_config()
             self.context_config = self.config_loader.get_context_config()
+            self.vision_config = config.get('vision_config', {})
 
             # 2. 初始化自我学习系统
             trade_log_path = self.experience_config.get('trade_log_path', './user_data/logs/trade_experience.jsonl')
@@ -150,6 +151,47 @@ class LLMFunctionStrategy(IStrategy):
             self.decision_checker = DecisionQualityChecker()
             self.trade_reviewer = TradeReviewer()
             logger.info("✓ 增强模块已初始化 (PositionTracker, MarketStateComparator, DecisionChecker, TradeReviewer)")
+            
+            # 11.5 初始化可视化模块（可选）
+            self.chart_generator = None
+            self.enable_chart = self.vision_config.get('enable_chart_attachment', False)
+            if self.enable_chart:
+                try:
+                    from llm_modules.visualization.chart_generator import ChartGenerator
+                    self.chart_generator = ChartGenerator(
+                        image_dir=self.vision_config.get('image_dir', './user_data/logs/images'),
+                        save_to_disk=self.vision_config.get('save_to_disk', True)
+                    )
+                    save_mode = "保存到磁盘" if self.vision_config.get('save_to_disk', True) else "仅内存"
+                    logger.info(f"✓ 图表生成器已启用 ({save_mode})")
+                except Exception as e:
+                    logger.warning(f"图表生成器初始化失败（将使用纯文本模式）: {e}")
+                    self.enable_chart = False
+            else:
+                logger.info("图表生成器已禁用（纯文本模式）")
+            
+            # 11.6 初始化 Gemini 视觉工具（可选）
+            self.vision_tools = None
+            gemini_config = config.get('gemini_vision_config', {})
+            if gemini_config.get('api_key') and self.enable_chart:
+                try:
+                    from llm_modules.tools.vision_tools import VisionTools
+                    self.vision_tools = VisionTools(
+                        api_base=gemini_config.get('api_base', 'https://generativelanguage.googleapis.com'),
+                        api_key=gemini_config['api_key'],
+                        vision_model=gemini_config.get('vision_model', 'gemini-2.5-flash-lite'),
+                        timeout=gemini_config.get('timeout', 60),
+                        skip_validation=gemini_config.get('skip_validation', False)
+                    )
+                    logger.info(f"✓ Gemini 视觉工具已启用 (模型: {gemini_config.get('vision_model')})")
+                except Exception as e:
+                    logger.warning(f"⚠️ Gemini 视觉工具初始化失败: {e}")
+                    logger.warning("   将使用纯文本模式（不包含视觉分析）")
+                    self.vision_tools = None
+            elif not self.enable_chart:
+                logger.info("Gemini 视觉工具已禁用（图表生成器未启用）")
+            else:
+                logger.info("Gemini 视觉工具已禁用（未配置 API 密钥）")
 
             # 12. 系统提示词（两套：开仓和持仓）
             self.entry_system_prompt = self.context_builder.build_entry_system_prompt()
@@ -517,7 +559,44 @@ class LLMFunctionStrategy(IStrategy):
                 else {}
             )
 
-            market_context = self.context_builder.build_market_context(
+            # 生成K线图（如果启用）
+            chart_image_b64 = None
+            if self.enable_chart and self.chart_generator:
+                try:
+                    logger.debug(f"{pair} | 开始生成K线图...")
+                    
+                    # 准备K线数据
+                    lookback = self.vision_config.get('chart_lookback', 50)
+                    df_for_chart = dataframe.tail(lookback).copy()
+                    kline_data = {
+                        'date': df_for_chart.index.tolist(),
+                        'open': df_for_chart['open'].tolist(),
+                        'high': df_for_chart['high'].tolist(),
+                        'low': df_for_chart['low'].tolist(),
+                        'close': df_for_chart['close'].tolist(),
+                        'volume': df_for_chart['volume'].tolist()
+                    }
+                    
+                    # 生成图表
+                    result = self.chart_generator.generate_combined_chart(
+                        kline_data=kline_data,
+                        lookback=lookback,
+                        dpi=self.vision_config.get('chart_dpi', 600),
+                        figsize=(
+                            self.vision_config.get('chart_width', 12),
+                            self.vision_config.get('chart_height', 5)
+                        ),
+                        pair=pair,
+                        timeframe=self.timeframe
+                    )
+                    chart_image_b64 = result.get("combined_image_b64")
+                    logger.info(f"{pair} | ✅ 图表已生成: {result.get('filename')}")
+                except Exception as e:
+                    logger.warning(f"{pair} | 图表生成失败，继续使用文本上下文: {e}")
+                    # 优雅降级：图片生成失败不影响决策
+
+            # 构建上下文（包含可选的Gemini视觉分析）
+            context_data = self.context_builder.build_market_context_with_image(
                 dataframe=dataframe,
                 metadata=metadata,
                 wallets=self.wallets,
@@ -525,8 +604,12 @@ class LLMFunctionStrategy(IStrategy):
                 exchange=exchange,
                 position_tracker=self.position_tracker,
                 market_comparator=self.market_comparator,
-                multi_timeframe_data=multi_tf_history
+                multi_timeframe_data=multi_tf_history,
+                chart_image_b64=chart_image_b64,
+                vision_tools=self.vision_tools  # 传递 Gemini 视觉工具
             )
+            
+            market_context = context_data["text_context"]
 
             # 构建决策请求
             decision_request = self.context_builder.build_decision_request(
@@ -535,7 +618,7 @@ class LLMFunctionStrategy(IStrategy):
                 position_context=""  # 已包含在market_context中
             )
 
-            # 调用LLM决策（使用开仓提示词）
+            # 调用LLM决策（使用开仓提示词，支持图片）
             messages = [
                 {"role": "system", "content": self._get_system_prompt(has_position=False)},
                 {"role": "user", "content": decision_request}

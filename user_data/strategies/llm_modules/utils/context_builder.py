@@ -4,6 +4,7 @@
 """
 import logging
 import math
+import json
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 import pandas as pd
@@ -82,6 +83,157 @@ class ContextBuilder:
             context_config.get("multi_timeframe_max_rows", 120)
         )
 
+    def _format_vision_analysis(self, result: Dict[str, Any]) -> str:
+        """
+        格式化视觉分析结果为可读文本
+        
+        Args:
+            result: vision_tools.analyze_image_with_gemini 返回的结果
+            
+        Returns:
+            格式化后的文本
+        """
+        if not result or not isinstance(result, dict):
+            return ""
+        
+        # 检查是否是错误响应
+        summary = result.get('summary', '')
+        if summary.startswith('VISION_CALL_FAILED'):
+            return f"⚠️ 视觉分析失败: {summary}"
+        
+        # 构建格式化文本
+        lines = []
+        
+        # 1. 总结
+        if summary:
+            lines.append(f"📊 **分析总结**：{summary}")
+            lines.append("")
+        
+        # 2. 趋势判断
+        judgement = result.get('judgement', {})
+        if judgement:
+            direction_emoji = {
+                'up': '📈 上涨',
+                'down': '📉 下跌',
+                'sideways': '➡️ 横盘'
+            }
+            direction = judgement.get('direction', 'unknown')
+            confidence = judgement.get('confidence', 0.0)
+            
+            lines.append(f"🎯 **趋势判断**：{direction_emoji.get(direction, direction)} (置信度: {confidence:.1%})")
+            
+            # 证据列表
+            evidence = judgement.get('evidence', [])
+            if evidence:
+                lines.append("   **支撑证据**：")
+                for i, item in enumerate(evidence, 1):
+                    lines.append(f"   {i}. {item}")
+            lines.append("")
+        
+        # 3. 识别的形态
+        patterns = result.get('patterns', [])
+        if patterns:
+            lines.append("🔍 **识别的K线形态**：")
+            for pattern in patterns:
+                name = pattern.get('name', 'Unknown')
+                conf = pattern.get('confidence', 0.0)
+                lines.append(f"   • {name} (置信度: {conf:.1%})")
+            lines.append("")
+        
+        # 4. 风险提示
+        risks = result.get('risks', [])
+        if risks:
+            lines.append("⚠️ **风险提示**：")
+            for i, risk in enumerate(risks, 1):
+                lines.append(f"   {i}. {risk}")
+            lines.append("")
+        
+        # 5. 任务类型（调试信息）
+        vision_task = result.get('vision_task', '')
+        if vision_task:
+            lines.append(f"_（分析类型: {vision_task}）_")
+        
+        return "\n".join(lines)
+
+    def build_market_context_with_image(
+        self,
+        dataframe: pd.DataFrame,
+        metadata: Dict[str, Any],
+        wallets: Any = None,
+        current_trades: Optional[List[Any]] = None,
+        exchange: Any = None,
+        position_tracker: Any = None,
+        market_comparator: Any = None,
+        multi_timeframe_data: Optional[Dict[str, pd.DataFrame]] = None,
+        chart_image_b64: Optional[str] = None,
+        vision_tools: Any = None
+    ) -> Dict[str, Any]:
+        """
+        构建完整的市场上下文（包含可选的Gemini视觉分析）
+
+        Args:
+            dataframe: OHLCV数据和所有技术指标
+            metadata: 交易对元数据
+            wallets: 钱包对象（用于获取账户余额）
+            current_trades: 当前所有持仓列表
+            exchange: 交易所对象（用于获取资金费率）
+            position_tracker: PositionTracker实例，提供持仓表现
+            market_comparator: MarketStateComparator实例，用于对比
+            multi_timeframe_data: 其他时间框架的K线与指标数据
+            chart_image_b64: 可选的base64编码图片
+            vision_tools: VisionTools实例，用于Gemini视觉分析
+
+        Returns:
+            {
+                "text_context": str,              # 文本上下文（包含视觉分析结果）
+                "has_vision_analysis": bool       # 是否包含视觉分析
+            }
+        """
+        # 构建文本上下文（调用原方法）
+        text_context = self.build_market_context(
+            dataframe=dataframe,
+            metadata=metadata,
+            wallets=wallets,
+            current_trades=current_trades,
+            exchange=exchange,
+            position_tracker=position_tracker,
+            market_comparator=market_comparator,
+            multi_timeframe_data=multi_timeframe_data
+        )
+        
+        # 如果有图片且提供了 vision_tools，调用 Gemini 分析
+        vision_analysis = ""
+        if chart_image_b64 and vision_tools:
+            try:
+                logger.info("📸 调用 Gemini 视觉分析...")
+                result = vision_tools.analyze_image_with_gemini(
+                    image_b64=chart_image_b64,
+                    task="trend",  # 趋势分析
+                    time_frame=metadata.get('timeframe', '30m'),
+                    pair=metadata.get('pair'),  # 交易对名称
+                    return_format="json"
+                )
+                
+                # 格式化结构化分析结果（充分利用 Pydantic 模型返回的数据）
+                vision_analysis = self._format_vision_analysis(result)
+                
+                logger.info("✅ Gemini 视觉分析完成")
+                logger.info(f"参数: {json.dumps(result, indent=4)}")
+                logger.debug(f"视觉分析长度: {len(vision_analysis)} 字符")
+            except Exception as e:
+                logger.error(f"❌ Gemini 视觉分析失败: {e}")
+                vision_analysis = ""
+        
+        # 将视觉分析结果添加到文本上下文
+        if vision_analysis:
+            text_context += f"\n\n{'='*60}\n【K线图视觉分析】\n{'='*60}\n{vision_analysis}\n{'='*60}"
+        
+        # 返回结构化数据
+        return {
+            "text_context": text_context,
+            "has_vision_analysis": bool(vision_analysis)
+        }
+    
     def build_market_context(
         self,
         dataframe: pd.DataFrame,
