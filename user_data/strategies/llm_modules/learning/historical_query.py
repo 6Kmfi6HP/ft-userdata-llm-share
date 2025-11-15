@@ -277,19 +277,19 @@ class HistoricalQueryEngine:
                 f"   入场价 {entry_price:.2f} → 出场价 {exit_price:.2f}"
             )
 
-            # 第三行：入场理由（截取关键部分）
+            # 第三行：入场理由
             lines.append(
-                f"   入场: {entry_reason[:80]}..."
+                f"   入场: {entry_reason}"
             )
 
-            # 第四行：出场理由（截取关键部分）
+            # 第四行：出场理由
             lines.append(
-                f"   出场: {exit_reason[:80]}..."
+                f"   出场: {exit_reason}"
             )
 
             # 添加教训（如果有）
             if lessons:
-                lines.append(f"   教训: {lessons[:100]}...")
+                lines.append(f"   教训: {lessons}")
 
         return '\n'.join(lines)
 

@@ -369,10 +369,10 @@ class SelfReflectionEngine:
             f"结果: {reflection['result_type']} {reflection['profit_pct']:+.2f}%",
             "",
             f"开仓时判断:",
-            f"  {reflection['entry_judgment'][:100]}...",
+            f"  {reflection['entry_judgment']}",
             "",
             f"实际走势:",
-            f"  {reflection['actual_outcome'][:100]}...",
+            f"  {reflection['actual_outcome']}",
             "",
             f"入场评分: {reflection['entry_quality']['score']}/100"
         ]
