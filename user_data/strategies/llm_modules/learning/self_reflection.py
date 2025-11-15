@@ -288,9 +288,9 @@ class SelfReflectionEngine:
         # 1. 从入场分析提取教训
         if entry_analysis['is_correct']:
             if entry_analysis['score'] >= 60:
-                lessons.append(f"✓ 入场信号'{entry_reason[:20]}...'可靠，可继续使用")
+                lessons.append(f"✓ 入场信号可靠，可继续使用")
         else:
-            lessons.append(f"✗ 入场信号'{entry_reason[:20]}...'不可靠，需谨慎")
+            lessons.append(f"✗ 入场信号不可靠，需谨慎")
 
         # 2. 从出场分析提取教训
         if position_metrics:

@@ -392,8 +392,8 @@ class TradeReviewer:
         # 入场/离场理由
         lines.extend([
             "决策记录:",
-            f"  入场理由: {review.get('entry_reason', '')[:100]}...",
-            f"  离场理由: {review.get('exit_reason', '')[:100]}...",
+            f"  入场理由: {review.get('entry_reason', '')}",
+            f"  离场理由: {review.get('exit_reason', '')}",
             "",
             "=" * 60
         ])
