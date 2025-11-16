@@ -62,9 +62,9 @@ class LLMFunctionStrategy(IStrategy):
     # 启动需要的历史数据
     startup_candle_count = 400  # 30分钟*400 = 约8.3天数据（确保4小时框架EMA50稳定）
 
-    # 策略不使用固定止损，由LLM在exit决策中完全控制
-    stoploss = -0.99  # 极端止损，实际由LLM决策平仓
-    use_custom_stoploss = False
+    # 止损配置：硬性止损 + 动态止损双重保护
+    stoploss = -0.15  # 15%硬性止损（可被config.json覆盖），作为LLM决策的最后防线
+    use_custom_stoploss = True  # 启用动态止损
 
     # 仓位调整
     position_adjustment_enable = True
@@ -521,8 +521,45 @@ class LLMFunctionStrategy(IStrategy):
     def populate_indicators(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
         """
         计算技术指标（30分钟基础数据）- 使用统一的 IndicatorCalculator
+        
+        注意: 图表生成依赖以下指标,确保都已计算:
+        - ema_20, ema_50 (均线系统)
+        - bb_upper, bb_middle, bb_lower (布林带)
+        - macd, macd_signal, macd_hist (MACD指标)
         """
-        return IndicatorCalculator.add_all_indicators(dataframe)
+        dataframe = IndicatorCalculator.add_all_indicators(dataframe)
+        
+        # 验证关键指标是否存在(每次运行都验证,因为可能用于不同时间框架)
+        required_indicators = {
+            'ema_20': '均线系统',
+            'ema_50': '均线系统', 
+            'bb_upper': '布林带',
+            'bb_middle': '布林带',
+            'bb_lower': '布林带',
+            'macd': 'MACD指标',
+            'macd_signal': 'MACD指标',
+            'macd_hist': 'MACD指标'
+        }
+        
+        missing = {ind: desc for ind, desc in required_indicators.items() if ind not in dataframe.columns}
+        
+        if missing:
+            if not hasattr(self, '_indicators_warning_shown'):
+                logger.warning(f"⚠️ 缺少图表所需指标: {list(missing.keys())}")
+                logger.warning(f"   影响的功能: {set(missing.values())}")
+                logger.warning("   Gemini视觉分析的图表说明可能包含不存在的指标")
+                logger.warning("   建议: 确保IndicatorCalculator正确计算所有指标")
+                self._indicators_warning_shown = True
+            
+            # 存储缺失的指标供图表生成时参考
+            self._missing_chart_indicators = missing
+        else:
+            if not hasattr(self, '_indicators_verified'):
+                logger.info("✓ 所有图表所需指标已就绪")
+                self._indicators_verified = True
+            self._missing_chart_indicators = {}
+        
+        return dataframe
 
     def populate_entry_trend(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
         """
@@ -568,14 +605,56 @@ class LLMFunctionStrategy(IStrategy):
                     # 准备K线数据
                     lookback = self.vision_config.get('chart_lookback', 50)
                     df_for_chart = dataframe.tail(lookback).copy()
+                    
+                    # Freqtrade使用RangeIndex，实际时间在'date'列中
+                    # 检查是否有'date'列
+                    if 'date' in df_for_chart.columns:
+                        date_series = df_for_chart['date']
+                        logger.info(f"{pair} | [DEBUG] 使用'date'列，类型: {date_series.dtype}, 前3个值: {date_series.head(3).tolist()}")
+                        
+                        # 转换为毫秒时间戳
+                        if pd.api.types.is_datetime64_any_dtype(date_series):
+                            # 如果是datetime类型，转为毫秒时间戳
+                            date_list = (date_series.astype('int64') // 10**6).tolist()
+                        else:
+                            # 如果已经是数字，检查单位（优化边界）
+                            first_val = date_series.iloc[0]
+                            if first_val > 1e11:  # 毫秒 (更严谨: >1973年)
+                                date_list = date_series.tolist()
+                            elif first_val > 1e8:  # 秒 (更严谨: >1973年)，转为毫秒
+                                date_list = (date_series * 1000).astype('int64').tolist()
+                            else:
+                                logger.warning(f"{pair} | date列值异常小: {first_val}")
+                                date_list = date_series.tolist()
+                    else:
+                        # 如果没有date列，尝试使用index（向后兼容）
+                        logger.warning(f"{pair} | DataFrame没有'date'列，使用index")
+                        date_values = df_for_chart.index
+                        if hasattr(date_values, 'astype') and hasattr(date_values, 'dtype'):
+                            if 'datetime' in str(date_values.dtype):
+                                date_list = (date_values.astype('int64') // 10**6).tolist()
+                            else:
+                                date_list = date_values.tolist()
+                        else:
+                            date_list = date_values.tolist()
+                    
+                    logger.info(f"{pair} | [DEBUG] 最终date_list前3个值: {date_list[:3]}")
+                    
                     kline_data = {
-                        'date': df_for_chart.index.tolist(),
+                        'date': date_list,
                         'open': df_for_chart['open'].tolist(),
                         'high': df_for_chart['high'].tolist(),
                         'low': df_for_chart['low'].tolist(),
                         'close': df_for_chart['close'].tolist(),
                         'volume': df_for_chart['volume'].tolist()
                     }
+                    
+                    # 添加技术指标数据（如果存在）
+                    optional_indicators = ['ema_20', 'ema_50', 'bb_upper', 'bb_middle', 'bb_lower', 
+                                          'macd', 'macd_signal', 'macd_hist']
+                    for indicator in optional_indicators:
+                        if indicator in df_for_chart.columns:
+                            kline_data[indicator] = df_for_chart[indicator].tolist()
                     
                     # 生成图表
                     result = self.chart_generator.generate_combined_chart(
@@ -606,7 +685,8 @@ class LLMFunctionStrategy(IStrategy):
                 market_comparator=self.market_comparator,
                 multi_timeframe_data=multi_tf_history,
                 chart_image_b64=chart_image_b64,
-                vision_tools=self.vision_tools  # 传递 Gemini 视觉工具
+                vision_tools=self.vision_tools,  # 传递 Gemini 视觉工具
+                is_position_management=False  # 开仓场景,显示R:R参考而非持仓追踪
             )
             
             market_context = context_data["text_context"]
@@ -738,17 +818,9 @@ class LLMFunctionStrategy(IStrategy):
                 else {}
             )
 
-            market_context = self.context_builder.build_market_context(
-                dataframe=dataframe,
-                metadata=metadata,
-                wallets=self.wallets,
-                current_trades=current_trades,
-                exchange=exchange,
-                position_tracker=self.position_tracker,
-                market_comparator=self.market_comparator,
-                multi_timeframe_data=multi_tf_history
-            )
-
+            # ✅ 修复X1: 先更新PositionTracker,再构建上下文
+            # 原因: build_market_context需要从position_tracker获取最新的MFE/dd_ratio等指标
+            
             # 更新 PositionTracker 和关联 MarketComparator
             pair_trades = [t for t in current_trades if t.pair == pair]
 
@@ -770,29 +842,59 @@ class LLMFunctionStrategy(IStrategy):
                         is_short=trade.is_short,
                         leverage=trade.leverage,
                         decision_type='check',  # 正在检查是否平仓
-                        decision_reason=''  # 稍后在决策后更新
+                        decision_reason='',  # 稍后在决策后更新
+                        open_date=trade.open_date  # 传入真实开仓时间
                     )
 
-                    # 关联待定的开仓状态（如果存在）
-                    temp_key = f"{pair}_{trade.open_rate}"
-                    if hasattr(self, '_pending_entry_states') and temp_key in self._pending_entry_states:
-                        pending = self._pending_entry_states[temp_key]
-                        # 保存到 MarketComparator
-                        self.market_comparator.save_entry_state(
-                            trade_id=trade.id,
-                            pair=pair,
-                            price=trade.open_rate,
-                            indicators=pending['indicators'],
-                            entry_reason=pending['entry_tag'],
-                            trend_alignment='',
-                            market_sentiment=''
-                        )
-                        # 清除待定状态
-                        del self._pending_entry_states[temp_key]
-                        logger.debug(f"已关联开仓状态到 trade_id={trade.id}")
+                    # 关联待定的开仓状态（如果存在）- 支持容错匹配
+                    pending = None
+                    if hasattr(self, '_pending_entry_states'):
+                        # 优先精确匹配
+                        temp_key = f"{pair}_{trade.open_rate}"
+                        if temp_key in self._pending_entry_states:
+                            pending = self._pending_entry_states[temp_key]
+                            del self._pending_entry_states[temp_key]
+                        else:
+                            # 容错匹配: 找到同pair且价格接近的pending entry (±0.5%容差)
+                            for key, entry in list(self._pending_entry_states.items()):
+                                if entry['pair'] == pair:
+                                    price_diff_pct = abs(entry['rate'] - trade.open_rate) / trade.open_rate * 100
+                                    if price_diff_pct < 0.5:  # 0.5%容差
+                                        pending = entry
+                                        del self._pending_entry_states[key]
+                                        logger.debug(f"容错匹配开仓状态: 请求价={entry['rate']:.8f}, 成交价={trade.open_rate:.8f}, 偏差={price_diff_pct:.3f}%")
+                                        break
+                        
+                        # 如果找到了pending entry,保存到MarketComparator
+                        if pending:
+                            self.market_comparator.save_entry_state(
+                                trade_id=trade.id,
+                                pair=pair,
+                                price=trade.open_rate,
+                                indicators=pending['indicators'],
+                                entry_reason=pending['entry_tag'],
+                                trend_alignment='',
+                                market_sentiment=''
+                            )
+                            logger.debug(f"✅ 已关联开仓状态到 trade_id={trade.id}")
+                        else:
+                            logger.debug(f"⚠️ 未找到匹配的pending entry state for {pair} @ {trade.open_rate}")
 
                 except Exception as e:
                     logger.debug(f"更新持仓追踪失败: {e}")
+
+            # ✅ 现在PositionTracker已更新,可以安全地构建上下文(包含最新的MFE/dd_ratio)
+            market_context = self.context_builder.build_market_context(
+                dataframe=dataframe,
+                metadata=metadata,
+                wallets=self.wallets,
+                current_trades=current_trades,
+                exchange=exchange,
+                position_tracker=self.position_tracker,
+                market_comparator=self.market_comparator,
+                multi_timeframe_data=multi_tf_history,
+                is_position_management=True  # 持仓管理场景，显示详细追踪数据
+            )
 
             # 构建决策请求
             decision_request = self.context_builder.build_decision_request(
@@ -935,6 +1037,95 @@ class LLMFunctionStrategy(IStrategy):
             logger.error(f"平仓决策失败 {pair}: {e}")
 
         return dataframe
+
+    def custom_stoploss(
+        self,
+        pair: str,
+        trade: Any,
+        current_time: datetime,
+        current_rate: float,
+        current_profit: float,
+        after_fill: bool,
+        **kwargs
+    ) -> Optional[float]:
+        """
+        动态止损 - 作为LLM决策的安全网（基于ATR%动态调整）
+        
+        功能:
+        1. 根据ATR%动态调整止损阈值,适应不同币种的波动率
+        2. 盈利达到阈值时移动止损,保护已获利润
+        3. 这不会影响LLM的主动平仓决策,只是在LLM未及时响应时提供保护
+        
+        Args:
+            pair: 交易对
+            trade: 交易对象
+            current_time: 当前时间
+            current_rate: 当前价格
+            current_profit: 当前盈亏比例
+            after_fill: 是否在订单成交后
+            **kwargs: 其他参数
+            
+        Returns:
+            新的止损比例,或None保持默认止损
+        """
+        from freqtrade.strategy.strategy_helper import stoploss_from_open
+        
+        # 获取最新数据和ATR%
+        try:
+            dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+            if dataframe is None or len(dataframe) == 0:
+                return None
+            
+            latest = dataframe.iloc[-1]
+            atr_value = latest.get('atr', 0)
+            close_price = latest.get('close', 0)
+            
+            if atr_value <= 0 or close_price <= 0:
+                # 如果ATR不可用,使用固定阈值(向后兼容)
+                atr_pct = 1.0  # 默认1%
+            else:
+                atr_pct = (atr_value / close_price) * 100
+            
+            # 基于ATR%动态调整阈值
+            # 高波动币种(ATR% > 2%): 阈值提高50%
+            # 中波动币种(1% < ATR% <= 2%): 标准阈值
+            # 低波动币种(ATR% <= 1%): 阈值降低30%
+            if atr_pct > 2.0:
+                multiplier = 1.5  # 高波动
+            elif atr_pct > 1.0:
+                multiplier = 1.0  # 中波动
+            else:
+                multiplier = 0.7  # 低波动
+            
+            # 动态阈值
+            threshold_1 = 0.05 * multiplier  # 基础: 5%
+            threshold_2 = 0.10 * multiplier  # 中级: 10%
+            threshold_3 = 0.20 * multiplier  # 高级: 20%
+            
+            protection_1 = 0.02 * multiplier  # 保护: 2%
+            protection_2 = 0.05 * multiplier  # 保护: 5%
+            protection_3 = 0.10 * multiplier  # 保护: 10%
+            
+            # 根据当前盈利调整止损
+            if current_profit > threshold_3:
+                return stoploss_from_open(protection_3, current_profit, 
+                                         is_short=trade.is_short, 
+                                         leverage=trade.leverage)
+            elif current_profit > threshold_2:
+                return stoploss_from_open(protection_2, current_profit, 
+                                         is_short=trade.is_short, 
+                                         leverage=trade.leverage)
+            elif current_profit > threshold_1:
+                return stoploss_from_open(protection_1, current_profit, 
+                                         is_short=trade.is_short, 
+                                         leverage=trade.leverage)
+            
+            # 盈利未达到阈值,使用默认止损
+            return None
+            
+        except Exception as e:
+            logger.debug(f"动态止损计算失败 {pair}: {e}")
+            return None  # 出错时使用默认止损
 
     def leverage(
         self,

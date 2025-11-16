@@ -232,7 +232,9 @@ class ChartGenerator:
         """
         # 1. 如果提供了外部数据，直接使用
         if kline_data is not None:
+            logger.debug(f"接收到kline_data，date列前3个值: {kline_data.get('date', [])[:3]}")
             df = pd.DataFrame(kline_data)
+            logger.debug(f"DataFrame创建后，date列dtype: {df['date'].dtype}, 前3个值: {df['date'].iloc[:3].tolist()}")
         # 2. 否则尝试从缓存获取
         elif self.runtime_market_cache_getter is not None:
             try:
@@ -256,7 +258,29 @@ class ChartGenerator:
         
         # 转换date为DatetimeIndex（mplfinance要求）
         if 'date' in df.columns:
-            df['date'] = pd.to_datetime(df['date'])
+            # 检测时间戳类型并转换（优化边界判断）
+            if df['date'].dtype in ['int64', 'float64']:
+                # 如果是数字时间戳，根据数值范围判断单位
+                first_val = df['date'].iloc[0]
+                logger.debug(f"时间戳转换调试: first_val={first_val}, dtype={df['date'].dtype}")
+                
+                # 使用更严谨的边界值判断
+                if first_val > 1e15:  # 纳秒时间戳 (>2003年的纳秒: 1e15 ≈ 2001-09-09)
+                    df['date'] = pd.to_datetime(df['date'], unit='ns')
+                    logger.debug(f"使用纳秒转换: {df['date'].iloc[0]} ~ {df['date'].iloc[-1]}")
+                elif first_val > 1e11:  # 毫秒时间戳 (>1973年的毫秒: 1e11 ≈ 1973-03-03)
+                    df['date'] = pd.to_datetime(df['date'], unit='ms')
+                    logger.debug(f"使用毫秒转换: {df['date'].iloc[0]} ~ {df['date'].iloc[-1]}")
+                elif first_val > 1e8:  # 秒时间戳 (>1973年的秒: 1e8 ≈ 1973-03-03)
+                    df['date'] = pd.to_datetime(df['date'], unit='s')
+                    logger.debug(f"使用秒转换: {df['date'].iloc[0]} ~ {df['date'].iloc[-1]}")
+                else:
+                    # 时间戳值异常小，可能是错误数据
+                    raise ValueError(f"时间戳值异常: {first_val}，无法判断时间单位")
+            else:
+                # 字符串格式，直接转换
+                df['date'] = pd.to_datetime(df['date'])
+                logger.debug(f"字符串转换: {df['date'].iloc[0]} ~ {df['date'].iloc[-1]}")
             df.set_index('date', inplace=True)
         
         return df
@@ -313,12 +337,24 @@ class ChartGenerator:
             support_line = support_coefs[0] * np.arange(len(df)) + support_coefs[1]
             resist_line = resist_coefs[0] * np.arange(len(df)) + resist_coefs[1]
             
-            # 3. 生成上半部分图片（价格图 + 趋势线）
-            logger.debug("生成上半部分图片（价格图+趋势线）")
+            # 3. 生成上半部分图片（价格图 + 趋势线 + EMA + 布林带）
+            logger.debug("生成上半部分图片（价格图+趋势线+EMA+布林带）")
             apds = [
                 mpf.make_addplot(support_line, color="blue", width=1.5, label="Support"),
                 mpf.make_addplot(resist_line, color="red", width=1.5, label="Resistance")
             ]
+            
+            # 添加 EMA 均线（如果存在）
+            if 'ema_20' in df.columns:
+                apds.append(mpf.make_addplot(df['ema_20'], color='orange', width=1.2, label='EMA20'))
+            if 'ema_50' in df.columns:
+                apds.append(mpf.make_addplot(df['ema_50'], color='purple', width=1.2, label='EMA50'))
+            
+            # 添加布林带（如果存在）
+            if all(col in df.columns for col in ['bb_upper', 'bb_middle', 'bb_lower']):
+                apds.append(mpf.make_addplot(df['bb_upper'], color='gray', width=0.8, linestyle='--', alpha=0.5))
+                apds.append(mpf.make_addplot(df['bb_middle'], color='gray', width=0.8, linestyle='--', alpha=0.5))
+                apds.append(mpf.make_addplot(df['bb_lower'], color='gray', width=0.8, linestyle='--', alpha=0.5))
             
             fig1, axes1 = mpf.plot(
                 df,
@@ -327,8 +363,9 @@ class ChartGenerator:
                 addplot=apds,
                 returnfig=True,
                 figsize=figsize,
-                title="Price Chart with Trendlines",
-                ylabel="Price"
+                title="Price Chart with Trendlines & Indicators",
+                ylabel="Price",
+                volume=True  # 添加成交量面板
             )
             
             # 添加元数据标注（左上角）
@@ -349,17 +386,30 @@ class ChartGenerator:
             img1 = Image.open(buf1)
             plt.close(fig1)  # 释放内存
             
-            # 4. 生成下半部分图片（标准K线图）
-            logger.debug("生成下半部分图片（标准K线图）")
-            fig2, axes2 = mpf.plot(
-                df,
-                type="candle",
-                style="charles",
-                returnfig=True,
-                figsize=figsize,
-                title="Candlestick Pattern Chart",
-                ylabel="Price"
-            )
+            # 4. 生成下半部分图片（标准K线图 + MACD）
+            logger.debug("生成下半部分图片（标准K线图+MACD）")
+            
+            # 准备 MACD 附加图（如果存在）
+            apds_lower = []
+            if all(col in df.columns for col in ['macd', 'macd_signal', 'macd_hist']):
+                apds_lower.append(mpf.make_addplot(df['macd'], panel=1, color='blue', width=1.0, ylabel='MACD'))
+                apds_lower.append(mpf.make_addplot(df['macd_signal'], panel=1, color='red', width=1.0))
+                apds_lower.append(mpf.make_addplot(df['macd_hist'], panel=1, type='bar', color='gray', alpha=0.5))
+            
+            # 构建 plot 参数（mplfinance 不接受 addplot=None）
+            plot_kwargs = {
+                'type': 'candle',
+                'style': 'charles',
+                'returnfig': True,
+                'figsize': figsize,
+                'title': 'Candlestick Pattern Chart with MACD',
+                'ylabel': 'Price',
+                'volume': True
+            }
+            if apds_lower:
+                plot_kwargs['addplot'] = apds_lower
+            
+            fig2, axes2 = mpf.plot(df, **plot_kwargs)
             
             # 添加时间范围标注（左上角）
             start_time = df.index[0].strftime("%Y-%m-%d %H:%M")

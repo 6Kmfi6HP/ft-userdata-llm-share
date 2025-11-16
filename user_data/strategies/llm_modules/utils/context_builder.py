@@ -106,7 +106,7 @@ class ContextBuilder:
         
         # 1. 总结
         if summary:
-            lines.append(f"📊 **分析总结**：{summary}")
+            lines.append(f"📊 分析总结：{summary}")
             lines.append("")
         
         # 2. 趋势判断
@@ -120,12 +120,12 @@ class ContextBuilder:
             direction = judgement.get('direction', 'unknown')
             confidence = judgement.get('confidence', 0.0)
             
-            lines.append(f"🎯 **趋势判断**：{direction_emoji.get(direction, direction)} (置信度: {confidence:.1%})")
+            lines.append(f"🎯 趋势判断：{direction_emoji.get(direction, direction)} (置信度: {confidence:.1%})")
             
             # 证据列表
             evidence = judgement.get('evidence', [])
             if evidence:
-                lines.append("   **支撑证据**：")
+                lines.append("   支撑证据：")
                 for i, item in enumerate(evidence, 1):
                     lines.append(f"   {i}. {item}")
             lines.append("")
@@ -133,25 +133,29 @@ class ContextBuilder:
         # 3. 识别的形态
         patterns = result.get('patterns', [])
         if patterns:
-            lines.append("🔍 **识别的K线形态**：")
+            lines.append("🔍 识别的K线形态：")
             for pattern in patterns:
                 name = pattern.get('name', 'Unknown')
                 conf = pattern.get('confidence', 0.0)
                 lines.append(f"   • {name} (置信度: {conf:.1%})")
             lines.append("")
+        else:
+            # 警告：未识别到形态
+            lines.append("⚠️ 未识别到明确的K线形态（市场可能处于过渡状态或震荡）")
+            lines.append("")
         
         # 4. 风险提示
         risks = result.get('risks', [])
         if risks:
-            lines.append("⚠️ **风险提示**：")
+            lines.append("⚠️ 风险提示：")
             for i, risk in enumerate(risks, 1):
                 lines.append(f"   {i}. {risk}")
             lines.append("")
         
         # 5. 任务类型（调试信息）
-        vision_task = result.get('vision_task', '')
-        if vision_task:
-            lines.append(f"_（分析类型: {vision_task}）_")
+        # vision_task = result.get('vision_task', '')
+        # if vision_task:
+        #     lines.append(f"_（分析类型: {vision_task}）_")
         
         return "\n".join(lines)
 
@@ -166,7 +170,8 @@ class ContextBuilder:
         market_comparator: Any = None,
         multi_timeframe_data: Optional[Dict[str, pd.DataFrame]] = None,
         chart_image_b64: Optional[str] = None,
-        vision_tools: Any = None
+        vision_tools: Any = None,
+        is_position_management: bool = False
     ) -> Dict[str, Any]:
         """
         构建完整的市场上下文（包含可选的Gemini视觉分析）
@@ -182,6 +187,7 @@ class ContextBuilder:
             multi_timeframe_data: 其他时间框架的K线与指标数据
             chart_image_b64: 可选的base64编码图片
             vision_tools: VisionTools实例，用于Gemini视觉分析
+            is_position_management: 是否为持仓管理场景（True=持仓，False=开仓，必须明确指定）
 
         Returns:
             {
@@ -189,6 +195,19 @@ class ContextBuilder:
                 "has_vision_analysis": bool       # 是否包含视觉分析
             }
         """
+        # ✅ 修复：类型安全校验（宽容模式，避免生产故障）
+        if not isinstance(is_position_management, bool):
+            # ✅ 宽容转换：常见错误类型
+            if is_position_management in (None, 0, '', [], {}):
+                self.logger.warning(f"build_market_context_with_image: is_position_management={is_position_management} 被转换为False")
+                is_position_management = False
+            elif is_position_management in (1, 'true', 'True', 'TRUE'):
+                self.logger.warning(f"build_market_context_with_image: is_position_management={is_position_management} 被转换为True")
+                is_position_management = True
+            else:
+                # 无法转换的类型：记录错误并使用安全默认值
+                self.logger.error(f"build_market_context_with_image: is_position_management类型错误={type(is_position_management)}, 默认使用False")
+                is_position_management = False
         # 构建文本上下文（调用原方法）
         text_context = self.build_market_context(
             dataframe=dataframe,
@@ -198,7 +217,8 @@ class ContextBuilder:
             exchange=exchange,
             position_tracker=position_tracker,
             market_comparator=market_comparator,
-            multi_timeframe_data=multi_timeframe_data
+            multi_timeframe_data=multi_timeframe_data,
+            is_position_management=is_position_management
         )
         
         # 如果有图片且提供了 vision_tools，调用 Gemini 分析
@@ -243,7 +263,8 @@ class ContextBuilder:
         exchange: Any = None,
         position_tracker: Any = None,
         market_comparator: Any = None,
-        multi_timeframe_data: Optional[Dict[str, pd.DataFrame]] = None
+        multi_timeframe_data: Optional[Dict[str, pd.DataFrame]] = None,
+        is_position_management: bool = False
     ) -> str:
         """
         构建完整的市场上下文（一次性提供所有数据）
@@ -257,10 +278,25 @@ class ContextBuilder:
             position_tracker: PositionTracker实例，提供持仓表现
             market_comparator: MarketStateComparator实例，用于对比
             multi_timeframe_data: 其他时间框架的K线与指标数据
+            is_position_management: 是否为持仓管理场景（True=持仓，False=开仓，必须明确指定）
 
         Returns:
             格式化的完整上下文字符串
         """
+        # ✅ 修复：类型安全校验（宽容模式，避免生产故障）
+        if not isinstance(is_position_management, bool):
+            # ✅ 宽容转换：常见错误类型
+            if is_position_management in (None, 0, '', [], {}):
+                self.logger.warning(f"build_market_context: is_position_management={is_position_management} 被转换为False")
+                is_position_management = False
+            elif is_position_management in (1, 'true', 'True', 'TRUE'):
+                self.logger.warning(f"build_market_context: is_position_management={is_position_management} 被转换为True")
+                is_position_management = True
+            else:
+                # 无法转换的类型：记录错误并使用安全默认值
+                self.logger.error(f"build_market_context: is_position_management类型错误={type(is_position_management)}, 默认使用False")
+                is_position_management = False
+        
         pair = metadata.get('pair', 'UNKNOWN')
 
         # 获取最新数据
@@ -417,6 +453,136 @@ class ContextBuilder:
             for ind, val in indicators_1d:
                 context_parts.append(f"  {ind}: {val:.4f}")
 
+        # 市场结构分析（开仓和持仓都需要，用于计算key_swing）
+        market_structure = self._analyze_market_structure(dataframe, lookback=100)
+        context_parts.append("")
+        context_parts.append("【市场结构与关键指标】")
+        
+        # ✅ 修复：处理数据不足的情况，提供降级默认值
+        if market_structure.get('structure') == '数据不足':
+            context_parts.append(f"  结构类型: {market_structure['structure']}")
+            # ✅ 补强：校验current_price有效性
+            current_price_temp = latest.get('close', 0)
+            if current_price_temp and current_price_temp > 0:
+                swing_high = current_price_temp * 1.02
+                swing_low = current_price_temp * 0.98
+                context_parts.append(f"  摆动高点(swing_high): {swing_high:.8f} (降级估算)")
+                context_parts.append(f"  摆动低点(swing_low): {swing_low:.8f} (降级估算)")
+                context_parts.append("  ⚠️ 数据不足，swing基于当前价±2%估算，精度较低")
+            else:
+                # ✅ 极端情况：当前价也不可用
+                swing_high = swing_low = None
+                context_parts.append("  摆动高点(swing_high): 数据不可用")
+                context_parts.append("  摆动低点(swing_low): 数据不可用")
+                context_parts.append("  ⚠️ 数据严重不足，无法计算swing，建议谨慎操作")
+                self.logger.warning(f"极端情况：current_price不可用，无法降级swing")
+        else:
+            # ✅ 补强：安全读取，防止键缺失
+            swing_high = market_structure.get('swing_high')
+            swing_low = market_structure.get('swing_low')
+            
+            if swing_high is not None and swing_low is not None:
+                context_parts.append(f"  结构类型: {market_structure['structure']}")
+                context_parts.append(f"  摆动高点(swing_high): {swing_high:.8f}")
+                context_parts.append(f"  摆动低点(swing_low): {swing_low:.8f}")
+                context_parts.append(f"  距离摆动高点: +{market_structure.get('distance_to_high_pct', 0):.2f}%")
+                context_parts.append(f"  距离摆动低点: -{market_structure.get('distance_to_low_pct', 0):.2f}%")
+                context_parts.append(f"  区间波动幅度: {market_structure.get('range_pct', 0):.2f}%")
+            else:
+                # ✅ 降级：structure≠'数据不足'但键缺失，fallback到降级逻辑
+                self.logger.warning(f"market_structure键缺失：structure={market_structure.get('structure')}")
+                current_price_temp = latest.get('close', 0)
+                if current_price_temp and current_price_temp > 0:
+                    swing_high = current_price_temp * 1.02
+                    swing_low = current_price_temp * 0.98
+                    context_parts.append(f"  结构类型: {market_structure.get('structure')} (swing降级)")
+                    context_parts.append(f"  摆动高点(swing_high): {swing_high:.8f} (API异常降级)")
+                    context_parts.append(f"  摆动低点(swing_low): {swing_low:.8f} (API异常降级)")
+                else:
+                    swing_high = swing_low = None
+                    context_parts.append("  ⚠️ swing数据完全不可用")
+        
+        # 添加ATR%（波动率百分比） - 开仓和持仓都需要
+        atr_value = latest.get('atr', 0)
+        current_price = latest.get('close', 0)
+        
+        # ATR可用时显示详细信息
+        if atr_value > 0 and current_price > 0:
+            atr_pct = (atr_value / current_price) * 100
+            context_parts.append(f"  ATR%: {atr_pct:.3f}% (波动率)")
+            context_parts.append(f"  ATR值: {atr_value:.8f}")
+            
+            # 仅在开仓场景(无持仓)时提供建议参考，用于R:R计算
+            if not is_position_management:
+                # ✅ 致命问题修复：检查swing可用性，避免None导致TypeError
+                if swing_high is not None and swing_low is not None and swing_high > swing_low:
+                    context_parts.append("")
+                    context_parts.append("【R:R计算参考建议】")
+                    context_parts.append("  以下为基于市场结构的参考建议(非强制)，用于计算风险收益比:")
+                    
+                    # 做多建议 - 使用ATR优化止损位
+                    long_target = swing_high
+                    long_stop = swing_low - atr_value * 0.6
+                    context_parts.append(f"  【做多参考】")
+                    context_parts.append(f"    建议目标位: {long_target:.8f} (摆动高点)")
+                    context_parts.append(f"    建议止损位: {long_stop:.8f} (摆动低点 - 0.6×ATR)")
+                    
+                    # 做空建议 - 使用ATR优化止损位
+                    short_target = swing_low
+                    short_stop = swing_high + atr_value * 0.6
+                    context_parts.append(f"  【做空参考】")
+                    context_parts.append(f"    建议目标位: {short_target:.8f} (摆动低点)")
+                    context_parts.append(f"    建议止损位: {short_stop:.8f} (摆动高点 + 0.6×ATR)")
+                    context_parts.append("")
+                    context_parts.append("  说明: 可基于上述参考或自行判断关键位来计算R:R值")
+                else:
+                    # swing不可用，无法提供R:R参考
+                    context_parts.append("")
+                    context_parts.append("  ⚠️ R:R参考不可用: swing数据不足，建议谨慎开仓或等待数据稳定")
+                    self.logger.warning(f"R:R计算跳过: swing_high={swing_high}, swing_low={swing_low}")
+        
+        # ✅ 修复X2: ATR不可用时的fallback - 区分开仓/持仓场景
+        else:
+            # ATR缺失,需要明确告知
+            context_parts.append(f"  ATR%: 数据不可用 (指标计算中)")
+            
+            if not is_position_management:
+                # ✅ 致命问题修复：检查swing可用性
+                if swing_high is not None and swing_low is not None and swing_high > swing_low:
+                    # 开仓场景: 提供简化R:R参考
+                    context_parts.append("")
+                    context_parts.append("【R:R计算参考建议(简化)】")
+                    context_parts.append("  ⚠️ ATR数据不可用,提供基于swing的简化参考:")
+                    context_parts.append("  注意: 无ATR数据时建议谨慎开仓或等待指标稳定")
+                    context_parts.append("")
+                    
+                    # 做多简化参考 - 仅基于swing
+                    swing_range = swing_high - swing_low
+                    long_target = swing_high
+                    long_stop = swing_low - swing_range * 0.05  # 使用区间的5%作为缓冲
+                    context_parts.append(f"  【做多参考(简化)】")
+                    context_parts.append(f"    建议目标位: {long_target:.8f} (摆动高点)")
+                    context_parts.append(f"    建议止损位: {long_stop:.8f} (摆动低点 - 5%区间)")
+                    
+                    # 做空简化参考 - 仅基于swing
+                    short_target = swing_low
+                    short_stop = swing_high + swing_range * 0.05
+                    context_parts.append(f"  【做空参考(简化)】")
+                    context_parts.append(f"    建议目标位: {short_target:.8f} (摆动低点)")
+                    context_parts.append(f"    建议止损位: {short_stop:.8f} (摆动高点 + 5%区间)")
+                    context_parts.append("")
+                    context_parts.append("  说明: 简化参考基于swing区间,精度较低,建议等待ATR稳定")
+                else:
+                    # swing和ATR都不可用
+                    context_parts.append("")
+                    context_parts.append("  ⚠️ R:R参考完全不可用: swing和ATR数据均不足")
+                    context_parts.append("  强烈建议: 等待数据稳定后再开仓，或使用极小仓位试探")
+                    self.logger.warning(f"R:R简化计算跳过: swing和ATR均不可用")
+            else:
+                # 持仓场景: 警告波动率评估受限
+                context_parts.append("  ⚠️ 无ATR数据,波动率评估受限,建议谨慎调整仓位")
+                context_parts.append("  说明: 持仓保护规则中的ATR倍数参考不可用,仅基于swing结构判断")
+
         # 添加账户信息
         if wallets:
             context_parts.append("")
@@ -488,37 +654,100 @@ class ContextBuilder:
                     context_parts.append(f"    持仓时间: {time_str}")
                     context_parts.append(f"    投入: {stake:.2f}U")
 
-                    # 添加PositionTracker的追踪数据
-                    if position_tracker:
-                        try:
-                            trade_id = getattr(trade, 'id', None)
-                            if trade_id:
-                                metrics = position_tracker.get_position_metrics(trade_id)
-                                if metrics:
+                    # ✅ 修复X3: 添加PositionTracker的追踪数据（含失败警告）
+                    if is_position_management:
+                        # 持仓管理场景必须尝试获取追踪数据
+                        if not position_tracker:
+                            # 场景1: position_tracker对象未初始化
+                            context_parts.append("")
+                            context_parts.append("    ⚠️【持仓追踪数据不可用】")
+                            context_parts.append("      原因: PositionTracker未初始化")
+                            context_parts.append("      影响: 无法获取MFE/MAE/dd_ratio等指标")
+                            context_parts.append("      建议: 仅基于价格、指标、时长决策,谨慎处理")
+                        else:
+                            try:
+                                trade_id = getattr(trade, 'id', None)
+                                if not trade_id:
+                                    # 场景2: trade对象没有id(可能是回测模式特殊情况)
                                     context_parts.append("")
-                                    context_parts.append("    【持仓追踪数据】")
-                                    context_parts.append(f"      最大浮盈(MFE): {metrics['max_profit_pct']:+.2f}%")
-                                    context_parts.append(f"      最大浮亏(MAE): {metrics['max_loss_pct']:+.2f}%")
-                                    if metrics['drawdown_from_peak_pct'] < -1:
-                                        context_parts.append(f"      盈利回撤: {metrics['drawdown_from_peak_pct']:+.2f}% (从峰值{metrics['max_profit_pct']:+.2f}%)")
-                                    context_parts.append(f"      hold次数: {metrics['hold_count']}次")
+                                    context_parts.append("    ⚠️【持仓追踪数据不可用】")
+                                    context_parts.append("      原因: trade.id为空(可能是回测模式)")
+                                    context_parts.append("      影响: 无法获取MFE/MAE/dd_ratio等指标")
+                                    context_parts.append("      建议: 仅基于价格、指标、时长决策")
+                                else:
+                                    metrics = position_tracker.get_position_metrics(trade_id)
+                                    if not metrics:
+                                        # 场景3: trade_id在positions中不存在
+                                        context_parts.append("")
+                                        context_parts.append("    ⚠️【持仓追踪数据不可用】")
+                                        context_parts.append(f"      原因: 未找到trade_id={trade_id}的追踪记录")
+                                        context_parts.append("      可能原因: update_position未调用或调用顺序错误")
+                                        context_parts.append("      影响: 无法获取MFE/MAE/dd_ratio等指标")
+                                        context_parts.append("      建议: 仅基于价格、指标、时长决策,谨慎处理")
+                                    else:
+                                        # 场景4: 成功获取metrics,正常显示
+                                        context_parts.append("")
+                                        context_parts.append("    【✅持仓追踪数据可用】")  # ✅ 优化：更明确的标记
+                                        context_parts.append(f"      最大浮盈(MFE): {metrics.get('max_profit_pct', 0):+.2f}%")
+                                        
+                                        # current_profit_pct只在update_position后才有，如果没有则从position_tracker重新计算
+                                        current_profit_pct = metrics.get('current_profit_pct')
+                                        if current_profit_pct is None:
+                                            # 从trade对象计算当前盈亏
+                                            if is_short:
+                                                current_profit_pct = (open_rate - current_price) / open_rate * leverage * 100
+                                            else:
+                                                current_profit_pct = (current_price - open_rate) / open_rate * leverage * 100
+                                        
+                                        context_parts.append(f"      当前盈亏(CP): {current_profit_pct:+.2f}%")
+                                        context_parts.append(f"      最大浮亏(MAE): {metrics.get('max_loss_pct', 0):+.2f}%")
+                                        
+                                        # 添加DD和dd_ratio - 动态利润保护的核心指标（统一公式）
+                                        max_profit = metrics.get('max_profit_pct', 0)
+                                        if current_profit_pct is not None and max_profit > 0:
+                                            # 统一公式: DD = MFE - CP, dd_ratio = DD / MFE
+                                            dd = max_profit - current_profit_pct  # DD = MFE - CP
+                                            dd_ratio = dd / max_profit if max_profit > 0 else 0
+                                            dd_ratio_pct = dd_ratio * 100
+                                            context_parts.append(f"      回撤(DD): {dd:+.2f}% = MFE - CP")
+                                            context_parts.append(f"      dd_ratio(回撤比): {dd_ratio_pct:.1f}% = DD / MFE")
+                                        
+                                        drawdown_from_peak = metrics.get('drawdown_from_peak_pct')
+                                        if drawdown_from_peak is not None and drawdown_from_peak < -1:
+                                            context_parts.append(f"      盈利回撤: {drawdown_from_peak:+.2f}% (从峰值{max_profit:+.2f}%)")
+                                        
+                                        # 添加持仓时长
+                                        time_in_pos = metrics.get('time_in_position_hours')
+                                        if time_in_pos is not None:
+                                            context_parts.append(f"      持仓时长: {time_in_pos:.1f}小时")
+                                        
+                                        # ATR%已在【市场结构与关键指标】区块显示，此处不重复
+                                        
+                                        hold_count = metrics.get('hold_count', 0)
+                                        context_parts.append(f"      hold次数: {hold_count}次")
 
-                                    # hold模式记录（不添加评价）
-                                    hold_pattern = metrics.get('hold_pattern', {})
-                                    if hold_pattern.get('pattern') == 'stuck_in_loop':
-                                        context_parts.append(f"      连续{hold_pattern['repeat_count']}次使用相似理由hold")
-                                        context_parts.append(f"      重复理由: \"{hold_pattern['repeated_reason']}\"")
-                                    elif hold_pattern.get('pattern') == 'repeated_reasoning':
-                                        context_parts.append(f"      理由重复度: {hold_pattern['repeat_count']}/{hold_pattern['total_holds']}")
+                                        # hold模式记录（不添加评价）
+                                        hold_pattern = metrics.get('hold_pattern', {})
+                                        if hold_pattern.get('pattern') == 'stuck_in_loop':
+                                            context_parts.append(f"      连续{hold_pattern.get('repeat_count', 0)}次使用相似理由hold")
+                                            context_parts.append(f"      重复理由: \"{hold_pattern.get('repeated_reason', '')}\"")
+                                        elif hold_pattern.get('pattern') == 'repeated_reasoning':
+                                            context_parts.append(f"      理由重复度: {hold_pattern.get('repeat_count', 0)}/{hold_pattern.get('total_holds', 0)}")
 
-                                    # 最近决策（完整显示，不截断）
-                                    if metrics.get('recent_decisions'):
-                                        context_parts.append("      最近3次决策:")
-                                        for d in metrics['recent_decisions'][-3:]:
-                                            time_str_short = d['time'].strftime("%H:%M")
-                                            context_parts.append(f"        [{time_str_short}] {d['type']}: {d['reason']}")
-                        except Exception as e:
-                            pass  # 静默失败，不影响主流程
+                                        # 最近决策（完整显示，不截断）
+                                        recent_decisions = metrics.get('recent_decisions', [])
+                                        if recent_decisions:
+                                            context_parts.append("      最近3次决策:")
+                                            for d in recent_decisions[-3:]:
+                                                # time可能是ISO字符串
+                                                time_val = d.get('time', '')
+                                                if isinstance(time_val, str) and len(time_val) >= 16:
+                                                    time_str_short = time_val[11:16]  # 提取 HH:MM
+                                                else:
+                                                    time_str_short = str(time_val)[:5]
+                                                context_parts.append(f"        [{time_str_short}] {d.get('type', '')}: {d.get('reason', '')}")
+                            except Exception as e:
+                                pass  # 静默失败，不影响主流程
 
                     # 开仓理由（完整显示，不限制字符）
                     if enter_tag:
