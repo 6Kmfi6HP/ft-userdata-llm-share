@@ -148,7 +148,7 @@ class TradingTools:
             },
             {
                 "name": "adjust_position",
-                "description": "加仓/减仓 - 调整现有持仓大小",
+                "description": "加仓/减仓 - 调整现有持仓大小。正数=加仓(趋势加强),负数=减仓(部分止盈/风险降低)。推荐: 盈利10%+时可用-30~-70减仓锁定部分利润",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -158,7 +158,7 @@ class TradingTools:
                         },
                         "adjustment_pct": {
                             "type": "number",
-                            "description": "调整百分比 (正数=加仓, 负数=减仓)，例如 50 表示加仓50%，-30 表示减仓30%"
+                            "description": "调整百分比 (正数=加仓, 负数=减仓)。例: 50=加仓50%, -30=减仓30%(部分止盈), -50=减仓50%(大幅止盈)"
                         },
                         "confidence_score": {
                             "type": "number",
@@ -166,15 +166,15 @@ class TradingTools:
                         },
                         "key_support": {
                             "type": "number",
-                            "description": "关键支撑位价格"
+                            "description": "关键支撑位价格(做多)/阻力位价格(做空) - 用于后续追踪"
                         },
                         "key_resistance": {
                             "type": "number",
-                            "description": "关键阻力位价格"
+                            "description": "关键阻力位价格(做多)/支撑位价格(做空) - 用于后续追踪"
                         },
                         "reason": {
                             "type": "string",
-                            "description": "调整理由 - 说明为什么加仓或减仓"
+                            "description": "调整理由 - 说明为什么加仓或减仓,包括技术面信号和盈利保护考虑"
                         }
                     },
                     "required": ["pair", "adjustment_pct", "confidence_score", "key_support", "key_resistance", "reason"]
@@ -607,6 +607,24 @@ class TradingTools:
         """获取缓存的信号"""
         return self._signal_cache.get(pair)
 
+    def clear_signal_for_pair(self, pair: str):
+        """
+        清除指定交易对的信号缓存（线程安全）
+
+        🔧 修复C4: 使用按交易对清除，避免多交易对环境下的竞态条件
+
+        Args:
+            pair: 交易对名称（如 "BTC/USDT:USDT"）
+        """
+        if pair in self._signal_cache:
+            del self._signal_cache[pair]
+            logger.debug(f"已清除 {pair} 的信号缓存")
+
     def clear_signals(self):
-        """清空信号缓存"""
+        """
+        清空所有信号缓存
+
+        ⚠️ DEPRECATED: 在多交易对环境下可能导致竞态条件
+        请使用 clear_signal_for_pair(pair) 代替
+        """
         self._signal_cache.clear()

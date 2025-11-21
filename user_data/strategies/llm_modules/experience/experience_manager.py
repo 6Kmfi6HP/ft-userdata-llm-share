@@ -6,8 +6,32 @@ import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from collections import defaultdict
+import copy
 
 logger = logging.getLogger(__name__)
+
+
+def _make_json_serializable(obj: Any) -> Any:
+    """
+    递归地将对象转换为 JSON 可序列化的格式
+    
+    Args:
+        obj: 要转换的对象
+        
+    Returns:
+        JSON 可序列化的对象
+    """
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    elif isinstance(obj, dict):
+        return {k: _make_json_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [_make_json_serializable(item) for item in obj]
+    elif isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    else:
+        # 其他类型尝试转换为字符串
+        return str(obj)
 
 
 class ExperienceManager:
@@ -224,8 +248,10 @@ class ExperienceManager:
                     'exit_price': exit_price,
                     'market_condition': market_condition
                 }
+                # 清理 position_metrics 中的不可序列化对象（如 datetime）
                 if position_metrics:
-                    decision_context.update(position_metrics)
+                    clean_metrics = _make_json_serializable(position_metrics)
+                    decision_context.update(clean_metrics)
 
                 self.reward_learning.record_reward(
                     trade_id=trade_id,

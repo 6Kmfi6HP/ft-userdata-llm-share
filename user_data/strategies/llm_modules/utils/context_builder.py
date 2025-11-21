@@ -15,6 +15,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from context.data_formatter import DataFormatter
 from context.prompt_builder import PromptBuilder
+# 🔧 修复M6: 导入浮点比较容差常量
+from .stoploss_calculator import StoplossCalculator, PROFIT_EPSILON
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +24,16 @@ logger = logging.getLogger(__name__)
 class ContextBuilder:
     """LLM上下文构建器（门面类，协调各个模块）"""
 
-    def __init__(self, context_config: Dict[str, Any], historical_query_engine=None, pattern_analyzer=None, tradable_balance_ratio=1.0, max_open_trades=1):
+    def __init__(
+        self,
+        context_config: Dict[str, Any],
+        historical_query_engine=None,
+        pattern_analyzer=None,
+        tradable_balance_ratio=1.0,
+        max_open_trades=1,
+        stoploss_config: Optional[Dict[str, Any]] = None,
+        hard_stoploss_pct: Optional[float] = None
+    ):
         """
         初始化上下文构建器
 
@@ -30,10 +41,17 @@ class ContextBuilder:
             context_config: 上下文配置
             historical_query_engine: 历史查询引擎实例（可选）
             pattern_analyzer: 模式分析器实例（可选）
-            tradable_balance_ratio: 可交易余额比例（如0.5表示只用50%资金）
-            max_open_trades: 最大持仓数量
+            tradable_balance_ratio: 可交易余额比例
+            max_open_trades: 最大开仓数
+            stoploss_config: 止损配置（🔧 修复M8: 从配置读取利润阈值）
+            hard_stoploss_pct: 硬止损百分比（🔧 修复M9: 从策略读取硬止损值）
         """
         self.config = context_config
+
+        # 🔧 修复M8+M9: 存储止损相关配置
+        self.stoploss_config = stoploss_config or {}
+        self.profit_threshold_1 = self.stoploss_config.get('profit_thresholds', [0.02, 0.06, 0.15])[0]
+        self.hard_stoploss_pct = hard_stoploss_pct if hard_stoploss_pct is not None else 6.0
         self.max_tokens = context_config.get("max_context_tokens", 6000)
         self.sentiment = MarketSentiment()  # 初始化市场情绪获取器
         self.tradable_balance_ratio = tradable_balance_ratio
@@ -293,6 +311,8 @@ class ContextBuilder:
             except Exception as e:
                 context_parts.append(f"  无法获取账户信息: {e}")
 
+
+
         # 添加持仓信息
         context_parts.append("")
         context_parts.append("【持仓情况】")
@@ -320,7 +340,10 @@ class ContextBuilder:
                     else:
                         profit_pct = (current_price - open_rate) / open_rate * leverage * 100
 
-                    # 计算持仓时间
+                    # 计算持仓时间（初始化默认值，防止未定义错误）
+                    hours = 0  # 默认值
+                    time_str = "未知"
+
                     if open_date:
                         from datetime import datetime, timezone
                         if isinstance(open_date, datetime):
@@ -346,6 +369,74 @@ class ContextBuilder:
                     context_parts.append(f"    当前盈亏: {profit_pct:+.2f}% ({profit_pct * stake / 100:+.2f}U)")
                     context_parts.append(f"    持仓时间: {time_str}")
                     context_parts.append(f"    投入: {stake:.2f}U")
+                    
+                    # 添加动态止损位信息(第2层ATR追踪止损) - 使用统一的StoplossCalculator
+                    try:
+                        # 🔧 修复M6+M8: 使用Epsilon容差 + 从配置读取阈值（而非硬编码2%）
+                        if (profit_pct / 100) > (self.profit_threshold_1 + PROFIT_EPSILON):
+                            atr = latest.get('atr', 0)
+                            adx = latest.get('adx', 0)
+                            atr_pct = (atr / current_price) if current_price > 0 and atr > 0 else 0.01
+                            
+                            # 使用 StoplossCalculator 统一计算止损价格
+                            stop_price = StoplossCalculator.calculate_stoploss_price(
+                                current_price=current_price,
+                                current_profit=profit_pct / 100,  # 转换为小数
+                                atr_pct=atr_pct,
+                                adx=adx,
+                                hold_duration_hours=hours,
+                                is_short=is_short,
+                                open_price=open_rate,
+                                config={'use_smooth_transition': True}
+                            )
+                            
+                            if stop_price is not None:
+                                # 计算止损距离百分比
+                                if is_short:
+                                    distance_pct = (stop_price - current_price) / current_price * 100
+                                else:
+                                    distance_pct = (current_price - stop_price) / current_price * 100
+                                
+                                # 判断利润区间
+                                if profit_pct > 15.0:
+                                    level = ">15%"
+                                elif profit_pct > 6.0:
+                                    level = "6-15%"
+                                else:
+                                    level = "2-6%"
+                                
+                                # 添加增强特性说明
+                                enhancements = []
+                                if hours > 2 and profit_pct < 6.0:
+                                    enhancements.append("时间衰减-20%")
+                                if adx > 25:
+                                    enhancements.append(f"强趋势ADX={adx:.0f},+20%")
+                                
+                                enhancement_msg = f" ({', '.join(enhancements)})" if enhancements else ""
+                                
+                                context_parts.append(f"    动态止损: {stop_price:.6f} (距离{distance_pct:.2f}%{enhancement_msg})")
+                                context_parts.append(f"      └─ 基于{level}利润区间 + ATR追踪 (平滑过渡)")
+                            else:
+                                # 🔧 修复M9: 从配置读取硬止损百分比（而非硬编码6.0）
+                                # StoplossCalculator返回None，表示应使用硬止损
+                                if is_short:
+                                    stop_price = open_rate * (1 + self.hard_stoploss_pct / 100)
+                                else:
+                                    stop_price = open_rate * (1 - self.hard_stoploss_pct / 100)
+                                context_parts.append(f"    硬止损: {stop_price:.6f} (-{self.hard_stoploss_pct:.1f}%)")
+                                context_parts.append(f"      └─ 盈利≤{self.profit_threshold_1*100:.1f}%时使用交易所硬止损")
+                        else:
+                            # 🔧 修复M9: 从配置读取硬止损百分比（而非硬编码6.0）
+                            # 使用硬止损
+                            if is_short:
+                                stop_price = open_rate * (1 + self.hard_stoploss_pct / 100)
+                            else:
+                                stop_price = open_rate * (1 - self.hard_stoploss_pct / 100)
+                            context_parts.append(f"    硬止损: {stop_price:.6f} (-{self.hard_stoploss_pct:.1f}%)")
+                            context_parts.append(f"      └─ 盈利≤{self.profit_threshold_1*100:.1f}%时使用交易所硬止损")
+                    except Exception as e:
+                        # 🔧 修复H6: 异常日志级别从 DEBUG 提升为 WARNING
+                        logger.warning(f"[上下文构建] 计算止损位失败: {e}")
 
                     # 添加PositionTracker的追踪数据
                     if position_tracker:
@@ -664,6 +755,8 @@ class ContextBuilder:
             "  - 摆动高点（swing high）= 阻力位，价格多次在此受阻",
             "  - 摆动低点（swing low）= 支撑位，价格多次在此止跌",
             "  - 价格位置相对关键位的距离决定风险收益比",
+            "",
+
         ]
 
         if self.include_timeframe_guidance:

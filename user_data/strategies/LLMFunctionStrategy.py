@@ -7,10 +7,11 @@ LLM Function Calling Strategy
 """
 
 import logging
+import math
 from typing import Dict, Any, Optional, List
 import pandas as pd
 from datetime import datetime
-from freqtrade.strategy import IStrategy, informative, merge_informative_pair
+from freqtrade.strategy import IStrategy, informative, merge_informative_pair, stoploss_from_absolute
 import talib.abstract as ta
 
 # 导入自定义模块
@@ -35,6 +36,7 @@ from llm_modules.experience.trade_reviewer import TradeReviewer
 from llm_modules.utils.position_tracker import PositionTracker
 from llm_modules.utils.market_comparator import MarketStateComparator
 from llm_modules.utils.decision_checker import DecisionQualityChecker
+from llm_modules.utils.stoploss_calculator import StoplossCalculator
 
 # 自我学习系统导入
 from llm_modules.learning.historical_query import HistoricalQueryEngine
@@ -62,9 +64,9 @@ class LLMFunctionStrategy(IStrategy):
     # 启动需要的历史数据
     startup_candle_count = 400  # 30分钟*400 = 约8.3天数据（确保4小时框架EMA50稳定）
 
-    # 策略不使用固定止损，由LLM在exit决策中完全控制
-    stoploss = -0.99  # 极端止损，实际由LLM决策平仓
-    use_custom_stoploss = False
+    # 启用分层止损保护：硬止损 + 动态追踪止损 + LLM 决策
+    stoploss = -0.10  # 10% 硬止损，防止爆仓（与config.json一致，期货10倍杠杆下价格空间1.0%）
+    use_custom_stoploss = True  # 启用自定义动态追踪止损
 
     # 仓位调整
     position_adjustment_enable = True
@@ -110,12 +112,15 @@ class LLMFunctionStrategy(IStrategy):
             logger.info("✓ 自我学习系统已初始化 (HistoricalQuery, PatternAnalyzer, SelfReflection, TradeEvaluator, RewardLearning)")
 
             # 3. 初始化上下文构建器（注入学习组件）
+            # 🔧 修复M8+M9: 传入止损配置，避免 ContextBuilder 中硬编码
             self.context_builder = ContextBuilder(
                 context_config=self.context_config,
                 historical_query_engine=self.historical_query,
                 pattern_analyzer=self.pattern_analyzer,
                 tradable_balance_ratio=config.get('tradable_balance_ratio', 1.0),
-                max_open_trades=config.get('max_open_trades', 1)
+                max_open_trades=config.get('max_open_trades', 1),
+                stoploss_config=config.get('custom_stoploss_config', {}),
+                hard_stoploss_pct=abs(self.stoploss) * 100  # 从策略的硬止损值转换为百分比
             )
 
             # 4. 初始化函数执行器
@@ -519,6 +524,8 @@ class LLMFunctionStrategy(IStrategy):
                 else {}
             )
 
+
+
             market_context = self.context_builder.build_market_context(
                 dataframe=dataframe,
                 metadata=metadata,
@@ -609,8 +616,8 @@ class LLMFunctionStrategy(IStrategy):
                     # 没有交易信号 = 观望，显示LLM的完整分析
                     logger.info(f"⏸️  {pair} | 未提供明确信号\n{llm_message}")
 
-                # 清空信号缓存
-                self.trading_tools.clear_signals()
+                # 🔧 修复C4: 清空当前交易对的信号缓存（避免竞态条件）
+                self.trading_tools.clear_signal_for_pair(pair)
 
         except Exception as e:
             logger.error(f"开仓决策失败 {pair}: {e}")
@@ -848,12 +855,95 @@ class LLMFunctionStrategy(IStrategy):
                         except Exception as e:
                             logger.debug(f"决策质量检查失败: {e}")
 
-                self.trading_tools.clear_signals()
+                # 🔧 修复C4: 清空当前交易对的信号缓存（避免竞态条件）
+                self.trading_tools.clear_signal_for_pair(pair)
 
         except Exception as e:
             logger.error(f"平仓决策失败 {pair}: {e}")
 
         return dataframe
+
+    def custom_exit(
+        self,
+        pair: str,
+        trade: Any,
+        current_time: datetime,
+        current_rate: float,
+        current_profit: float,
+        **kwargs
+    ) -> Optional[str]:
+        """
+        第4层止盈: 极端情况保护 (最小化干预LLM决策)
+        
+        【重要】只在极端情况下触发，绝大多数情况交给LLM决策：
+        - ROI > 50% + 极度超买/超卖 = 保护暴利
+        - ROI > 70% = 无条件强制保护
+        
+        杠杆处理：
+        - 默认自动按杠杆调整阈值（因为 current_profit 包含杠杆效应）
+        - 例如：10x杠杆下，5%价格波动 = 50% ROI
+        - 配置中的阈值会乘以杠杆倍数以匹配实际价格波动
+        - 可通过 custom_exit_config.use_leverage_adjusted_thresholds=False 禁用
+        
+        Returns:
+            止盈理由字符串,或None(交给LLM决策)
+        """
+        try:
+            # 获取技术指标
+            dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+            if dataframe.empty:
+                return None
+            
+            latest = dataframe.iloc[-1]
+            rsi = latest.get('rsi', 50)
+            
+            # 获取配置
+            exit_config = self.config.get('custom_exit_config', {})
+            # 阈值直接表示ROI百分比 (current_profit已包含杠杆效应)
+            extreme_profit_threshold = exit_config.get('extreme_profit_threshold', 0.50)
+            exceptional_profit_threshold = exit_config.get('exceptional_profit_threshold', 0.70)
+            rsi_threshold = exit_config.get('extreme_rsi_threshold', 90)
+            rsi_lower_bound = 100 - rsi_threshold
+            
+            # 浮点数比较容差（防止精度问题导致意外触发）
+            PROFIT_EPSILON = exit_config.get('profit_epsilon', 0.001)  # 可配置的容差，默认0.1%
+            
+            # 情况1: 超高利润(ROI>50%) + 极端超买/超卖 = 极端止盈保护
+            # 🔧 修复H2+H4: 使用减法提前触发保护 + 使用 >= 确保边界一致性
+            if current_profit >= (extreme_profit_threshold - PROFIT_EPSILON):
+                # 做空交易：RSI<10（超卖）时保护
+                if trade.is_short and rsi < rsi_lower_bound:
+                    logger.warning(
+                        f"[第4层-极端止盈] {pair} 做空 | "
+                        f"ROI {current_profit*100:.2f}% > {extreme_profit_threshold*100:.0f}% "
+                        f"+ RSI {rsi:.1f} < {rsi_lower_bound} - 强制保护"
+                    )
+                    return "extreme_profit_protection_short"
+                # 做多交易：RSI>90（超买）时保护
+                elif not trade.is_short and rsi > rsi_threshold:
+                    logger.warning(
+                        f"[第4层-极端止盈] {pair} 做多 | "
+                        f"ROI {current_profit*100:.2f}% > {extreme_profit_threshold*100:.0f}% "
+                        f"+ RSI {rsi:.1f} > {rsi_threshold} - 强制保护"
+                    )
+                    return "extreme_profit_protection_long"
+            
+            # 情况2: 暴利(ROI>70%) = 无条件保护（已经是优秀交易）
+            # 🔧 修复H2+H4: 使用减法提前触发保护 + 使用 >= 确保边界一致性
+            if current_profit >= (exceptional_profit_threshold - PROFIT_EPSILON):
+                logger.warning(
+                    f"[第4层-暴利保护] {pair} {'做空' if trade.is_short else '做多'} | "
+                    f"ROI {current_profit*100:.2f}% > {exceptional_profit_threshold*100:.0f}% "
+                    f"- 已达暴利水平，强制保护"
+                )
+                return "exceptional_profit_protection"
+            
+            # 其他所有情况: 完全交给LLM智能决策
+            return None
+            
+        except Exception as e:
+            logger.debug(f"{pair} custom_exit检查失败: {e}")
+            return None
 
     def leverage(
         self,
@@ -869,14 +959,29 @@ class LLMFunctionStrategy(IStrategy):
         """
         动态杠杆 - 由LLM决定或使用缓存值
         """
-        # 检查缓存
-        if pair in self._leverage_cache:
-            leverage_value = self._leverage_cache[pair]
-            del self._leverage_cache[pair]  # 使用后清除
+        # 🔧 修复H12: 确保缓存已初始化（防御性编程）
+        if not hasattr(self, '_leverage_cache'):
+            logger.warning(f"{pair} _leverage_cache 未初始化，重新创建")
+            self._leverage_cache = {}
+
+        # 🔧 修复C6: 使用原子操作获取并删除缓存（避免竞态条件）
+        leverage_value = self._leverage_cache.pop(pair, None)
+        if leverage_value is not None:
             return min(leverage_value, max_leverage)
 
         # 默认杠杆
         default_leverage = self.risk_config.get("default_leverage", 10)
+        
+        # 动态调整最大允许杠杆，防止止损位置低于强平线
+        # 假设强平线在 margin/leverage 位置，安全系数 0.8
+        # stoploss = 0.06, 意味着最大安全杠杆约为 1 / (0.06 * 1.2) ≈ 13.8x
+        # 所以如果当前 stoploss 是 6%，不应允许 20x 杠杆
+        safe_max_leverage = 1.0 / (abs(self.stoploss) * 1.1) # 留10%安全缓冲
+        
+        if max_leverage > safe_max_leverage:
+            logger.warning(f"{pair} 配置的最大杠杆 {max_leverage}x 风险过高(止损{self.stoploss})，已限制为安全值 {safe_max_leverage:.1f}x")
+            max_leverage = safe_max_leverage
+
         return min(default_leverage, max_leverage)
 
     def custom_stake_amount(
@@ -939,35 +1044,271 @@ class LLMFunctionStrategy(IStrategy):
         """
         pair = trade.pair
 
-        # 检查LLM是否有仓位调整决策
-        if pair in self._position_adjustment_cache:
-            adjustment_info = self._position_adjustment_cache[pair]
-            del self._position_adjustment_cache[pair]
+        # 🔧 修复C6: 使用原子操作获取并删除缓存（避免竞态条件）
+        adjustment_info = self._position_adjustment_cache.pop(pair, None)
+        if adjustment_info is None:
+            return None  # 无调整
 
-            adjustment_pct = adjustment_info.get("adjustment_pct", 0)
-            reason = adjustment_info.get("reason", "")
+        adjustment_pct = adjustment_info.get("adjustment_pct", 0)
+        reason = adjustment_info.get("reason", "")
 
-            # 计算调整金额
-            current_stake = trade.stake_amount
-            adjustment_stake = current_stake * (adjustment_pct / 100)
+        # 计算调整金额
+        current_stake = trade.stake_amount
+        adjustment_stake = current_stake * (adjustment_pct / 100)
 
-            if adjustment_pct > 0:
-                # 加仓
-                adjustment_stake = min(adjustment_stake, max_stake)
-                if min_stake and adjustment_stake < min_stake:
-                    logger.warning(f"{pair} 加仓金额 {adjustment_stake} 低于最小stake {min_stake}")
-                    return None
+        if adjustment_pct > 0:
+            # 加仓
+            adjustment_stake = min(adjustment_stake, max_stake)
+            if min_stake and adjustment_stake < min_stake:
+                logger.warning(f"{pair} 加仓金额 {adjustment_stake} 低于最小stake {min_stake}")
+                return None
 
-                logger.info(f"{pair} 加仓 {adjustment_pct:.1f}% = {adjustment_stake:.2f} USDT | {reason}")
-                return adjustment_stake
+            logger.info(f"{pair} 加仓 {adjustment_pct:.1f}% = {adjustment_stake:.2f} USDT | {reason}")
+            return adjustment_stake
 
-            elif adjustment_pct < 0:
-                # 减仓
-                max_reduce = -current_stake * 0.99  # 最多减99%（保留一点避免完全平仓）
-                adjustment_stake = max(adjustment_stake, max_reduce)
+        elif adjustment_pct < 0:
+            # 减仓
+            # 🔧 修复M5: 验证减仓后剩余仓位是否满足最小stake要求
+            remaining_stake = current_stake + adjustment_stake  # adjustment_stake 是负数
 
-                logger.info(f"{pair} 减仓 {abs(adjustment_pct):.1f}% = {adjustment_stake:.2f} USDT | {reason}")
-                return adjustment_stake
+            if min_stake and 0 < remaining_stake < min_stake:
+                logger.warning(
+                    f"{pair} 减仓后剩余仓位 {remaining_stake:.2f} USDT 低于最小要求 {min_stake:.2f} USDT. "
+                    f"拒绝减仓操作，建议全平或调整减仓幅度."
+                )
+                return None  # 拒绝无效的减仓
+
+            max_reduce = -current_stake * 0.99  # 最多减99%（保留一点避免完全平仓）
+            adjustment_stake = max(adjustment_stake, max_reduce)
+
+            logger.info(
+                f"{pair} 减仓 {abs(adjustment_pct):.1f}% = {adjustment_stake:.2f} USDT "
+                f"(剩余{remaining_stake:.2f}) | {reason}"
+            )
+            return adjustment_stake
 
         # 无调整
         return None
+
+    def custom_stoploss(
+        self,
+        pair: str,
+        trade: Any,
+        current_time: datetime,
+        current_rate: float,
+        current_profit: float,
+        after_fill: bool,
+        **kwargs
+    ) -> Optional[float]:
+        """
+        第2层：ATR动态追踪止损 + 时间衰减 + 趋势适应
+        
+        策略逻辑（使用平滑过渡避免跳变）：
+        - 盈利 ≤2%: 使用硬止损 -6% (self.stoploss)
+        - 盈利 2-6%: 追踪距离 = 1.5×ATR%, 最小1.5%
+        - 盈利 6-15%: 追踪距离 = 1.5x平滑过渡到1.0×ATR (线性插值)
+        - 盈利 >15%: 追踪距离 = 0.8×ATR%, 最小0.5%
+        
+        增强特性：
+        - 时间衰减: 持仓>2小时未达6%利润,收紧止损20%
+        - 趋势适应: ADX>25时,放宽追踪距离20%
+        
+        返回值：
+        - 相对于当前价格的止损百分比（负数），如 -0.05 表示当前价格下方5%
+        - None 表示使用硬止损 (self.stoploss)
+        
+        重要说明：
+        - Freqtrade 自动确保返回值不会比 self.stoploss 更宽松（硬止损作为绝对底线）
+        - 使用 StoplossCalculator.calculate_stoploss_price 计算绝对止损价格
+        - 使用 stoploss_from_absolute 转换为 Freqtrade 要求的格式（相对于当前价格）
+        - 不需要手动与 self.stoploss 比较，Freqtrade 引擎会自动执行此检查
+        """
+        from datetime import timedelta
+
+        # ✅ P0级新增：杠杆自适应硬止损验证
+        leverage = trade.leverage
+
+        # 计算杠杆自适应的安全止损阈值
+        # 公式：ROI止损% = 价格止损% × 杠杆
+        # 例如：10x杠杆下，-10% ROI 对应 -1% 价格波动
+        leverage_adjusted_hard_stop_price_pct = self.stoploss / leverage  # -0.10 / 10 = -0.01 (-1%价格)
+
+        logger.debug(
+            f"[第2层-ATR止损] {pair} {leverage}x杠杆 | "
+            f"ROI硬止损={self.stoploss*100:.1f}% | "
+            f"对应价格止损={leverage_adjusted_hard_stop_price_pct*100:.2f}%"
+        )
+
+        # 获取当前市场数据
+        try:
+            dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+            if dataframe.empty:
+                logger.warning(f"[第2层-ATR止损] {pair} dataframe为空，使用硬止损")
+                return None
+            
+            latest = dataframe.iloc[-1]
+            atr = latest.get('atr', 0)
+            adx = latest.get('adx', 0)
+            
+            # 计算ATR百分比并应用合理边界
+            # 防止极端ATR值导致不合理的止损设置
+            # 从配置中获取ATR上限，默认10%
+            # 🔧 修复: 使用实时价格current_rate而非过时的K线收盘价，确保价格一致性
+            stoploss_config = self.config.get('custom_stoploss_config', {})
+            MIN_ATR_PCT = 0.001  # 0.1% 最小ATR
+            MAX_ATR_PCT = stoploss_config.get('max_atr_pct', 0.10)  # 可配置的ATR上限
+            DEFAULT_ATR_PCT = 0.01  # 1% 默认值
+            
+            if current_rate > 0 and atr > 0:
+                atr_pct = atr / current_rate  # ✓ 使用实时价格，与后续stoploss_from_absolute()计算一致
+                # 应用边界限制
+                atr_pct = max(MIN_ATR_PCT, min(atr_pct, MAX_ATR_PCT))
+                
+                if atr_pct == MAX_ATR_PCT:
+                    logger.warning(
+                        f"[第2层-ATR止损] {pair} ATR过大被限制: "
+                        f"原始={atr/current_rate*100:.2f}%, 限制为{MAX_ATR_PCT*100:.0f}%"
+                    )
+            else:
+                atr_pct = DEFAULT_ATR_PCT
+                logger.debug(f"[第2层-ATR止损] {pair} ATR数据无效，使用默认值 {DEFAULT_ATR_PCT*100}%")
+            
+        except Exception as e:
+            logger.debug(f"[第2层-ATR止损] {pair} 获取数据失败: {e}, 使用硬止损")
+            return None
+        
+        # 使用 StoplossCalculator 计算目标止损价格（绝对值）
+        # 确保时间计算的时区安全性 - 统一转换为UTC
+        from datetime import timezone
+        
+        # 确保 current_time 是 UTC 时区aware
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=timezone.utc)
+        else:
+            current_time = current_time.astimezone(timezone.utc)
+        
+        # 确保 trade.open_date_utc 是 UTC 时区aware
+        if trade.open_date_utc.tzinfo is None:
+            trade_open = trade.open_date_utc.replace(tzinfo=timezone.utc)
+        else:
+            trade_open = trade.open_date_utc.astimezone(timezone.utc)
+            
+        hold_duration = current_time - trade_open
+        
+        # 加载自定义止损配置，并确保启用平滑过渡
+        custom_stoploss_config = self.config.get('custom_stoploss_config', {}).copy()
+        custom_stoploss_config['use_smooth_transition'] = True
+
+        # 1. 计算目标止损价格（基于当前价格和ATR动态距离）
+        target_stop_price = StoplossCalculator.calculate_stoploss_price(
+            current_price=current_rate,
+            current_profit=current_profit,
+            atr_pct=atr_pct,
+            adx=adx,
+            hold_duration_hours=hold_duration.total_seconds() / 3600,
+            is_short=trade.is_short,
+            open_price=trade.open_rate,
+            config=custom_stoploss_config
+        )
+
+        if target_stop_price is None:
+            return None
+
+        # 2. 验证止损价格的方向性（防止计算错误）
+        # 做多：止损价必须低于当前价（止损在下方）
+        # 做空：止损价必须高于当前价（止损在上方）
+        # 🔧 修复H1: 移除容差，使用直接方向检查
+
+        if trade.is_short:
+            if target_stop_price <= current_rate:
+                logger.error(
+                    f"[第2层-ATR止损] {pair} 做空止损价格错误: "
+                    f"止损价 {target_stop_price:.4f} <= 当前价 {current_rate:.4f} "
+                    f"(做空止损应该在当前价上方)"
+                )
+                return None
+        else:  # 做多
+            if target_stop_price >= current_rate:
+                logger.error(
+                    f"[第2层-ATR止损] {pair} 做多止损价格错误: "
+                    f"止损价 {target_stop_price:.4f} >= 当前价 {current_rate:.4f} "
+                    f"(做多止损应该在当前价下方)"
+                )
+                return None
+        
+        # 3. 🔧 修复M7: 防御性验证 current_rate 有效性
+        if not current_rate or current_rate <= 0:
+            logger.error(
+                f"[第2层-ATR止损] {pair} current_rate 无效: {current_rate}，使用硬止损"
+            )
+            return None
+
+        # 4. 检查止损价格与当前价的距离是否合理（防止极端值）
+        price_distance_pct = abs(target_stop_price - current_rate) / current_rate
+        MIN_STOP_DISTANCE = stoploss_config.get('min_stop_distance', 0.0001)  # 0.01% 最小距离
+        MAX_STOP_DISTANCE = stoploss_config.get('max_stop_distance', 0.50)    # 50% 最大距离
+        
+        if price_distance_pct < MIN_STOP_DISTANCE:
+            logger.warning(
+                f"[第2层-ATR止损] {pair} 止损距离过小: {price_distance_pct*100:.4f}% < {MIN_STOP_DISTANCE*100}%，使用硬止损"
+            )
+            return None
+        elif price_distance_pct > MAX_STOP_DISTANCE:
+            logger.warning(
+                f"[第2层-ATR止损] {pair} 止损距离过大: {price_distance_pct*100:.2f}% > {MAX_STOP_DISTANCE*100}%，使用硬止损"
+            )
+            return None
+
+        # 🔧 修复H9: 验证杠杆值的有效性（防止除零或类型错误）
+        leverage = getattr(trade, 'leverage', 0.0)
+        if not isinstance(leverage, (int, float)) or leverage <= 0:
+            logger.error(
+                f"[第2层-ATR止损] {pair} 无效的杠杆值: {leverage}，使用硬止损"
+            )
+            return None
+
+        # 5. 转换为 Freqtrade 要求的相对比例（使用官方helper函数）
+        # stoploss_from_absolute 会自动处理做多/做空和杠杆的计算
+        new_stoploss = stoploss_from_absolute(
+            target_stop_price,
+            current_rate,
+            is_short=trade.is_short,
+            leverage=leverage
+        )
+
+        # 🔧 修复C5: 完整的返回值验证（包括 NaN/Inf 检查）
+        # 5a. 检查是否为 None
+        if new_stoploss is None:
+            logger.debug(f"[第2层-ATR止损] {pair} 止损计算返回 None，使用硬止损")
+            return None
+
+        # 5b. 检查是否为有限数字（排除 NaN 和 Inf）
+        if not math.isfinite(new_stoploss):
+            logger.error(
+                f"[第2层-ATR止损] {pair} 止损值非有限数: {new_stoploss} "
+                f"(可能由于极端市场条件或计算错误)，使用硬止损"
+            )
+            return None
+
+        # 5c. 检查符号正确性（止损应该是负数）
+        if new_stoploss >= 0:
+            logger.debug(
+                f"[第2层-ATR止损] {pair} 计算的止损值无效 ({new_stoploss})，使用硬止损"
+            )
+            return None
+        
+        logger.debug(
+            f"[第2层-ATR止损] {pair} 动态追踪止损: {new_stoploss*100:.2f}% "
+            f"(当前盈利: {current_profit*100:.2f}%, 目标价: {target_stop_price:.4f})"
+        )
+
+        # 🔧 修复H5: 添加止损触发的 INFO 级别日志，提高可观测性
+        if new_stoploss is not None:
+            logger.info(
+                f"[第2层-ATR止损触发] {pair} | "
+                f"止损价: {target_stop_price:.6f} | "
+                f"当前盈利: {current_profit*100:+.2f}% | "
+                f"止损比例: {new_stoploss*100:.2f}%"
+            )
+
+        return new_stoploss
