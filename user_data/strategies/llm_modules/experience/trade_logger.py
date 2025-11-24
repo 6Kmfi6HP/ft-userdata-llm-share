@@ -115,7 +115,9 @@ class TradeLogger:
         stake_amount: float = 0,
         max_drawdown: float = 0,
         lessons: str = "",
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        trade_score: Optional[float] = None,  # ✅ 新增：LLM 评分 (0-100)
+        confidence_score: Optional[float] = None  # ✅ 新增：LLM 置信度 (0-100)
     ) -> bool:
         """
         记录交易
@@ -137,6 +139,8 @@ class TradeLogger:
             max_drawdown: 最大回撤
             lessons: 经验教训
             metadata: 额外数据
+            trade_score: LLM 对交易的评分 0-100（可选）
+            confidence_score: LLM 的置信度 0-100（可选）
 
         Returns:
             是否成功
@@ -169,6 +173,8 @@ class TradeLogger:
                 "duration_minutes": duration_minutes,
                 "max_drawdown": max_drawdown,
                 "lessons": lessons,
+                "trade_score": trade_score,  # ✅ 新增：LLM 评分
+                "confidence_score": confidence_score,  # ✅ 新增：LLM 置信度
                 "metadata": metadata or {}
             }
 

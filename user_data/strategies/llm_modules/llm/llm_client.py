@@ -25,15 +25,16 @@ class LLMClient:
         self.api_base = llm_config.get("api_base", "http://host.docker.internal:3120")
         self.api_key = llm_config.get("api_key", "")
         self.model = llm_config.get("model", "qwen/qwen3-coder-30b")
-        self.temperature = None  # 使用 LM Studio 的配置
-        self.max_tokens = None  # 使用 LM Studio 的配置
-        self.timeout = None  # 不设置超时限制，允许思考模型有足够时间推理
+        # 2025-01-23 优化：从配置读取temperature（Google白皮书建议推理任务用0.0）
+        self.temperature = llm_config.get("temperature", 0.0)
+        self.max_tokens = llm_config.get("max_tokens", 2500)
+        self.timeout = llm_config.get("timeout", 60)
 
         self.function_executor = function_executor
 
         # 对话历史(用于上下文管理)
         self.conversation_history: List[Dict[str, Any]] = []
-        self.max_history_length = 10  # 保留最近N轮对话
+        self.max_history_length = 5  # 保留最近N轮对话
 
         logger.info(f"LLM客户端已初始化: {self.model}")
 
@@ -89,15 +90,85 @@ class LLMClient:
                 tool_calls = message.get("tool_calls", [])
 
                 if not tool_calls or finish_reason == "stop":
-                    # 没有函数调用或已完成，返回最终响应
-                    logger.debug(f"✅ 决策完成 (迭代{iteration}, 原因: {finish_reason or '无函数调用'})")
-                    return {
-                        "success": True,
-                        "message": message_content,
-                        "function_calls": function_call_history,
-                        "iterations": iteration,
-                        "finish_reason": finish_reason
-                    }
+                    # 检查是否真的没有函数调用
+                    if not function_call_history:
+                        # LLM 完全没有调用任何函数
+                        logger.warning(f"⚠️  LLM 未调用任何函数 (迭代 {iteration}/{max_iterations}, finish_reason: {finish_reason})")
+                        logger.warning(f"消息内容: {message_content[:200] if message_content else '(空)'}")
+                        
+                        # 如果还有迭代机会，添加强制提示并重试
+                        if iteration < max_iterations:
+                            logger.info(f"🔄 尝试发送强制函数调用提示 (剩余 {max_iterations - iteration} 次机会)")
+                            
+                            # 添加强制性提示消息
+                            force_message = {
+                                "role": "user",
+                                "content": (
+                                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                    "🚨 CRITICAL ERROR DETECTED 🚨\n"
+                                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                                    "⚠️  SYSTEM REQUIREMENT VIOLATION:\n"
+                                    "You FAILED to call a function in your last response.\n\n"
+                                    "❌ What you did: Outputted text only\n"
+                                    "✅ What you MUST do: Call exactly ONE function\n\n"
+                                    "🔧 MANDATORY ACTIONS (choose one):\n"
+                                    "  1. signal_entry_long(pair, leverage, reason) - Open long\n"
+                                    "  2. signal_entry_short(pair, leverage, reason) - Open short\n"
+                                    "  3. signal_wait(reason) - Wait/observe\n"
+                                    "  4. signal_hold(reason) - Keep current position\n"
+                                    "  5. signal_exit(pair, trade_score, reason) - Close position\n"
+                                    "  6. adjust_position(pair, position_change_pct, reason) - Adjust\n\n"
+                                    "💡 IMPORTANT CLARIFICATIONS:\n"
+                                    "  • Functions are ACTIONS, not suggestions\n"
+                                    "  • \"Waiting\" requires calling signal_wait()\n"
+                                    "  • Explanations go in the 'reason' parameter\n"
+                                    "  • The system expects tool_calls, not conversational text\n\n"
+                                    "📌 RESPOND NOW: Call the appropriate function immediately.\n"
+                                    "    No more text-only responses will be accepted.\n"
+                                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                )
+                            }
+                            
+                            # 添加 LLM 的响应（如果有）到历史
+                            if message_content:
+                                current_messages.append({
+                                    "role": "assistant",
+                                    "content": message_content
+                                })
+                            
+                            # 添加强制提示
+                            current_messages.append(force_message)
+                            
+                            # 继续下一轮迭代
+                            logger.info(f"继续下一轮迭代...")
+                            continue
+                        else:
+                            # 已达最大迭代次数，仍未调用函数
+                            logger.error(f"❌ 已达最大迭代次数 ({max_iterations})，LLM 始终未调用任何函数!")
+                            logger.error("这通常表示:")
+                            logger.error("  1. tool_choice 设置不正确 (应为 'required')")
+                            logger.error("  2. 模型不支持 function calling")
+                            logger.error("  3. API 返回格式异常")
+                            logger.error("  4. prompt 指示不够明确")
+                            
+                            return {
+                                "success": False,
+                                "error": f"LLM 在 {max_iterations} 次迭代后仍未调用任何交易函数",
+                                "message": message_content,
+                                "function_calls": [],
+                                "iterations": iteration,
+                                "finish_reason": finish_reason
+                            }
+                    else:
+                        # 已经调用过函数,现在正常结束
+                        logger.debug(f"✅ 决策完成 (迭代{iteration}, 原因: {finish_reason or '函数调用完成'})")
+                        return {
+                            "success": True,
+                            "message": message_content,
+                            "function_calls": function_call_history,
+                            "iterations": iteration,
+                            "finish_reason": finish_reason
+                        }
 
                 # 执行函数调用
                 logger.debug(f"📞 本次迭代需要调用 {len(tool_calls)} 个函数")
@@ -191,13 +262,17 @@ class LLMClient:
                 "Authorization": f"Bearer {self.api_key}"
             }
 
+            # 构建payload
             payload = {
                 "model": self.model,
                 "messages": messages,
-                "tools": [{"type": "function", "function": f} for f in functions],
-                "tool_choice": "auto"
+                "tools": [{"type": "function", "function": f} for f in functions]
             }
-
+            
+            # 强制要求调用函数 (模型兼容性检查)
+            # OpenAI: 使用 "required" (标准模式)
+            payload["tool_choice"] = "required"
+            
             # 只添加非 None 的可选参数
             if self.temperature is not None:
                 payload["temperature"] = self.temperature
@@ -339,18 +414,25 @@ class LLMClient:
             return ""
 
         # 如果既没有内容也没有tool_calls，才是异常情况
-        logger.warning("消息中未找到 content、think、reasoning、reasoning_content 或 tool_calls 字段")
+        logger.error("❌ 消息中未找到 content、think、reasoning、reasoning_content 或 tool_calls 字段")
+        logger.error(f"完整 message 对象: {json.dumps(message, ensure_ascii=False)}")
         return ""
 
     def simple_call(
         self,
-        messages: List[Dict[str, str]]
+        messages: List[Dict[str, str]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None
     ) -> Optional[str]:
         """
         简单调用(不使用函数调用)
 
         Args:
-            消息列表
+            messages: 消息列表
+            temperature: 可选，覆盖实例默认温度值
+            max_tokens: 可选，覆盖实例默认最大token数
+            timeout: 可选，覆盖实例默认超时时间
 
         Returns:
             LLM响应文本
@@ -367,17 +449,22 @@ class LLMClient:
                 "messages": messages
             }
 
+            # 优先使用传入的参数，如果没有则使用实例默认值
+            temp_value = temperature if temperature is not None else self.temperature
+            max_tokens_value = max_tokens if max_tokens is not None else self.max_tokens
+            timeout_value = timeout if timeout is not None else self.timeout
+
             # 只添加非 None 的可选参数
-            if self.temperature is not None:
-                payload["temperature"] = self.temperature
-            if self.max_tokens is not None:
-                payload["max_tokens"] = self.max_tokens
+            if temp_value is not None:
+                payload["temperature"] = temp_value
+            if max_tokens_value is not None:
+                payload["max_tokens"] = max_tokens_value
 
             response = requests.post(
                 url,
                 json=payload,
                 headers=headers,
-                timeout=self.timeout
+                timeout=timeout_value
             )
 
             if response.status_code != 200:

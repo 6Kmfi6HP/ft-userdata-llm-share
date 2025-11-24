@@ -56,7 +56,7 @@ class TradingTools:
                         },
                         "trend_strength": {
                             "type": "string",
-                            "description": "趋势强度评估: '强势' | '中等' | '弱势'"
+                            "description": "趋势强度评估: '强势' | '中等' | '弱势' | '震荡' | '反转初期'"
                         },
                         "stake_amount": {
                             "type": "number",
@@ -102,7 +102,7 @@ class TradingTools:
                         },
                         "trend_strength": {
                             "type": "string",
-                            "description": "趋势强度评估: '强势' | '中等' | '弱势'"
+                            "description": "趋势强度评估: '强势' | '中等' | '弱势' | '震荡' | '反转初期'"
                         },
                         "stake_amount": {
                             "type": "number",
@@ -110,7 +110,7 @@ class TradingTools:
                         },
                         "reason": {
                             "type": "string",
-                            "description": "开仓理由"
+                            "description": "开仓理由 - 说明为什么开仓，以及对本次交易的反思和教训"
                         }
                     },
                     "required": ["pair", "leverage", "confidence_score", "key_support", "key_resistance", "rsi_value", "trend_strength", "reason"]

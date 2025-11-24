@@ -121,7 +121,9 @@ class ExperienceManager:
         max_drawdown: float,
         market_condition: str,
         position_metrics: Optional[Dict[str, Any]] = None,
-        market_changes: Optional[Dict[str, Any]] = None
+        market_changes: Optional[Dict[str, Any]] = None,
+        trade_score: Optional[float] = None,  # ✅ 新增：LLM 评分 (0-100)
+        confidence_score: Optional[float] = None  # ✅ 新增：LLM 置信度 (0-100)
     ):
         """
         记录交易完成
@@ -130,6 +132,8 @@ class ExperienceManager:
             (参数同trade_logger.log_trade)
             position_metrics: 持仓指标（可选）
             market_changes: 市场变化（可选）
+            trade_score: LLM 对交易的评分 0-100（可选）
+            confidence_score: LLM 的置信度 0-100（可选）
         """
         # 生成自我反思报告（如果启用）
         reflection_text = ""
@@ -286,7 +290,9 @@ class ExperienceManager:
             leverage=leverage,
             stake_amount=stake_amount,
             max_drawdown=max_drawdown,
-            lessons=lessons
+            lessons=lessons,
+            trade_score=trade_score,  # ✅ 新增：传递 LLM 评分
+            confidence_score=confidence_score  # ✅ 新增：传递 LLM 置信度
         )
 
         # 更新内存统计

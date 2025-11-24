@@ -26,6 +26,7 @@ class IndicatorCalculator:
         dataframe['ema_20'] = ta.EMA(dataframe, timeperiod=20)
         dataframe['ema_50'] = ta.EMA(dataframe, timeperiod=50)
         dataframe['ema_100'] = ta.EMA(dataframe, timeperiod=100)
+        dataframe['ema_200'] = ta.EMA(dataframe, timeperiod=200)  # EMA200策略核心指标
 
         return dataframe
 
@@ -101,6 +102,8 @@ class IndicatorCalculator:
         """
         dataframe['mfi'] = ta.MFI(dataframe, timeperiod=14)
         dataframe['obv'] = ta.OBV(dataframe)
+        dataframe['volma_20'] = ta.SMA(dataframe['volume'], timeperiod=20)  # VOLMA20成交量验证 (EMA200策略用)
+        dataframe['volume_ma'] = dataframe['volma_20']  # 向后兼容别名
 
         return dataframe
 
