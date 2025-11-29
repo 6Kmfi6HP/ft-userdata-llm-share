@@ -6,7 +6,7 @@ import json
 import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ class HistoricalQueryEngine:
                         trade = json.loads(line)
                         self._cache.append(trade)
 
-            self._last_load_time = datetime.now()
+            self._last_load_time = datetime.now(timezone.utc)
             logger.debug(f"已加载 {len(self._cache)} 笔历史交易")
         except Exception as e:
             logger.error(f"加载交易日志失败: {e}")
@@ -54,7 +54,7 @@ class HistoricalQueryEngine:
     def reload_if_needed(self, max_age_seconds: int = 60):
         """如果缓存过期则重新加载"""
         if not self._last_load_time or \
-           (datetime.now() - self._last_load_time).total_seconds() > max_age_seconds:
+           (datetime.now(timezone.utc) - self._last_load_time).total_seconds() > max_age_seconds:
             self._load_trades()
 
     def query_recent_trades(
@@ -84,10 +84,10 @@ class HistoricalQueryEngine:
 
         # 按时间筛选
         if days:
-            cutoff = datetime.now() - timedelta(days=days)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
             trades = [
                 t for t in trades
-                if datetime.fromisoformat(t.get('exit_time', '')) > cutoff
+                if self._parse_datetime_utc(t.get('exit_time', '')) > cutoff
             ]
 
         # 按时间倒序排序
@@ -99,6 +99,8 @@ class HistoricalQueryEngine:
 
         return trades[:limit]
 
+    # TODO: 未集成到主流程 - 考虑实现集成或在未来版本中移除
+    # 功能描述: 根据RSI和趋势查询相似市场条件下的历史交易
     def query_similar_conditions(
         self,
         pair: str,
@@ -216,8 +218,6 @@ class HistoricalQueryEngine:
         Returns:
             格式化的历史经验文本
         """
-        from datetime import datetime
-
         trades = self.query_recent_trades(pair=pair, limit=limit)
 
         if not trades:
@@ -240,8 +240,8 @@ class HistoricalQueryEngine:
             time_ago = ''
             if exit_time:
                 try:
-                    exit_dt = datetime.fromisoformat(exit_time)
-                    time_diff = datetime.now() - exit_dt
+                    exit_dt = self._parse_datetime_utc(exit_time)
+                    time_diff = datetime.now(timezone.utc) - exit_dt
                     hours_ago = int(time_diff.total_seconds() / 3600)
                     if hours_ago < 1:
                         minutes_ago = int(time_diff.total_seconds() / 60)
@@ -295,6 +295,32 @@ class HistoricalQueryEngine:
                 lines.append(f"   教训: {lessons}")
 
         return '\n'.join(lines)
+
+    def _parse_datetime_utc(self, time_str: str) -> datetime:
+        """
+        解析 ISO 格式时间字符串，统一转换为 UTC aware datetime
+        
+        Args:
+            time_str: ISO 格式时间字符串（可能包含或不包含时区信息）
+            
+        Returns:
+            UTC aware datetime 对象
+        """
+        if not time_str:
+            return datetime.now(timezone.utc)
+        
+        try:
+            dt = datetime.fromisoformat(time_str)
+            # 如果是 naive datetime，假设是 UTC 时间并添加时区信息
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            # 如果有时区信息，转换为 UTC
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt
+        except (ValueError, AttributeError) as e:
+            logger.warning(f"解析时间字符串失败: {time_str}, 错误: {e}")
+            return datetime.now(timezone.utc)
 
     def format_pair_summary_for_context(self, pair: str, days: int = 30) -> str:
         """

@@ -11,6 +11,9 @@ logger = logging.getLogger(__name__)
 class TradingTools:
     """交易控制工具集（简化版）"""
 
+    # 开仓强制门槛
+    MIN_CONFIDENCE_THRESHOLD = 80
+
     def __init__(self, strategy_instance):
         """
         初始化交易工具
@@ -274,6 +277,14 @@ class TradingTools:
             if stake_amount is not None and stake_amount <= 0:
                 return {"success": False, "message": "投入金额必须大于0"}
 
+            # 置信度门槛验证
+            if confidence_score < self.MIN_CONFIDENCE_THRESHOLD:
+                return {
+                    "success": False,
+                    "message": f"置信度{confidence_score}低于{self.MIN_CONFIDENCE_THRESHOLD}门槛，"
+                              f"不符合开仓条件。请调用signal_wait()观望。"
+                }
+
             # 缓存信号
             self._signal_cache[pair] = {
                 "action": "enter_long",
@@ -355,6 +366,14 @@ class TradingTools:
 
             if stake_amount is not None and stake_amount <= 0:
                 return {"success": False, "message": "投入金额必须大于0"}
+
+            # 置信度门槛验证
+            if confidence_score < self.MIN_CONFIDENCE_THRESHOLD:
+                return {
+                    "success": False,
+                    "message": f"置信度{confidence_score}低于{self.MIN_CONFIDENCE_THRESHOLD}门槛，"
+                              f"不符合开仓条件。请调用signal_wait()观望。"
+                }
 
             # 缓存信号
             self._signal_cache[pair] = {

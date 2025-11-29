@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Optional
 from pathlib import Path
 import json
 from datetime import datetime
+from llm_modules.utils.datetime_utils import normalize_timestamps
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +153,8 @@ class TradeLogger:
             # 计算持仓时长
             duration_minutes = 0
             if exit_time and entry_time:
+                # 统一时区
+                entry_time, exit_time = normalize_timestamps(entry_time, exit_time)
                 duration = exit_time - entry_time
                 duration_minutes = int(duration.total_seconds() / 60)
 

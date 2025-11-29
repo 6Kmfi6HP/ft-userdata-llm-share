@@ -54,6 +54,10 @@ from llm_modules.utils.market_comparator import MarketStateComparator
 from llm_modules.utils.position_tracker import PositionTracker
 from llm_modules.utils.stoploss_calculator import StoplossCalculator
 
+# 学术论文整合模块 (Kelly公式 + 组合风险管理)
+from llm_modules.utils.kelly_calculator import KellyCalculator
+from llm_modules.utils.portfolio_risk_manager import PortfolioRiskManager
+
 
 class LLMFunctionStrategy(IStrategy):
     """
@@ -88,6 +92,14 @@ class LLMFunctionStrategy(IStrategy):
         "entry": "market",
         "exit": "market",
     }
+
+    # 🛡️ 冷却期机制（硬编码 2 小时）
+    _cooldown_until: Dict[str, datetime] = {}
+    COOLDOWN_HOURS = 2  # 平仓后冷却期 2 小时
+
+    # 🛡️ 最小持仓时间硬约束（硬编码 90 分钟）
+    MIN_HOLDING_MINUTES = 90  # 最小持仓 90 分钟（3 根 K 线）
+    MIN_HOLDING_EXCEPTION_LOSS_PCT = -0.08  # 仅 -8% 以上亏损可提前退出
 
     def __init__(self, config: dict) -> None:
         """初始化策略"""
@@ -126,7 +138,19 @@ class LLMFunctionStrategy(IStrategy):
                 "✓ 自我学习系统已初始化 (HistoricalQuery, PatternAnalyzer, SelfReflection, TradeEvaluator, RewardLearning)"
             )
 
-            # 3. 初始化上下文构建器（注入学习组件）
+            # 2.5. 初始化学术论文整合模块 (Kelly + 组合风险管理)
+            kelly_config = config.get("kelly_config", {})
+            self.kelly_calculator = KellyCalculator(kelly_config) if kelly_config.get("enabled", True) else None
+
+            portfolio_risk_config = config.get("portfolio_risk_config", {})
+            self.portfolio_risk_manager = PortfolioRiskManager(portfolio_risk_config) if portfolio_risk_config.get("enabled", True) else None
+
+            if self.kelly_calculator:
+                logger.info("✓ Kelly公式仓位计算器已初始化 (基于Busseti et al. 2016)")
+            if self.portfolio_risk_manager:
+                logger.info("✓ 组合风险管理器已初始化 (软性警告模式)")
+
+            # 3. 初始化上下文构建器（注入学习组件 + 学术论文模块）
             # 🔧 修复M8+M9: 传入止损配置，避免 ContextBuilder 中硬编码
             self.context_builder = ContextBuilder(
                 context_config=self.context_config,
@@ -137,6 +161,8 @@ class LLMFunctionStrategy(IStrategy):
                 stoploss_config=config.get("custom_stoploss_config", {}),
                 hard_stoploss_pct=abs(self.stoploss)
                 * 100,  # 从策略的硬止损值转换为百分比
+                kelly_calculator=self.kelly_calculator,
+                portfolio_risk_manager=self.portfolio_risk_manager,
             )
 
             # 4. 初始化函数执行器
@@ -311,10 +337,26 @@ class LLMFunctionStrategy(IStrategy):
     ) -> bool:
         """
         开仓确认回调 - 保存市场状态到 MarketComparator
+        🛡️ 新增：冷却期检查（硬编码 2 小时）
 
         注意：此时 trade 对象还未创建，无法获取 trade_id
         暂时先获取技术指标，等 trade 创建后再关联
         """
+        # 🛡️ 冷却期检查（硬编码 2 小时）
+        if pair in self._cooldown_until:
+            cooldown_end = self._cooldown_until[pair]
+            if current_time < cooldown_end:
+                remaining = (cooldown_end - current_time).total_seconds() / 60
+                logger.info(
+                    f"⏸️ {pair} | 处于冷却期，剩余 {remaining:.0f} 分钟，"
+                    f"拒绝 {side} 开仓"
+                )
+                return False  # 拒绝开仓
+            else:
+                # 冷却期已过，清除记录
+                del self._cooldown_until[pair]
+                logger.debug(f"✅ {pair} | 冷却期已过，允许开仓")
+
         try:
             # 获取最新的dataframe
             dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
@@ -540,14 +582,23 @@ class LLMFunctionStrategy(IStrategy):
                 )
                 market_condition = f"MFE {max_profit_pct:+.2f}% / MAE {max_loss_pct:+.2f}% / 持仓 {duration_str} / {model_score_str}"
 
+                # 统一时区：确保 entry_time 和 exit_time 时区一致
+                from datetime import timezone
+                entry_time_unified = trade.open_date
+                exit_time_unified = exit_time
+                if entry_time_unified.tzinfo is None and exit_time_unified.tzinfo is not None:
+                    entry_time_unified = entry_time_unified.replace(tzinfo=timezone.utc)
+                elif entry_time_unified.tzinfo is not None and exit_time_unified.tzinfo is None:
+                    exit_time_unified = exit_time_unified.replace(tzinfo=timezone.utc)
+                
                 self.experience_manager.log_trade_completion(
                     trade_id=trade.id,
                     pair=pair,
                     side="short" if trade.is_short else "long",
-                    entry_time=trade.open_date,
+                    entry_time=entry_time_unified,  # ✅ 使用统一后的时间
                     entry_price=trade.open_rate,
                     entry_reason=getattr(trade, "enter_tag", "") or "未记录",
-                    exit_time=exit_time,
+                    exit_time=exit_time_unified,  # ✅ 使用统一后的时间
                     exit_price=rate,
                     exit_reason=final_exit_reason,  # ✅ 使用 LLM 生成的详细原因
                     profit_pct=profit_pct,
@@ -563,11 +614,30 @@ class LLMFunctionStrategy(IStrategy):
                 )
                 logger.info(f"✓ 交易 {trade.id} 已记录到历史日志")
 
+            # === 学术论文整合: 更新组合风险管理器 ===
+            if self.portfolio_risk_manager:
+                self.portfolio_risk_manager.record_trade_result(
+                    profit_pct=profit_pct,
+                    trade_info={
+                        "pair": pair,
+                        "side": "short" if trade.is_short else "long",
+                        "leverage": trade.leverage
+                    }
+                )
+
             # 清理追踪数据
             if trade.id in self.position_tracker.positions:
                 del self.position_tracker.positions[trade.id]
             if trade.id in self.market_comparator.entry_states:
                 del self.market_comparator.entry_states[trade.id]
+
+            # 🛡️ 设置冷却期（硬编码 2 小时）
+            cooldown_end = current_time + timedelta(hours=self.COOLDOWN_HOURS)
+            self._cooldown_until[pair] = cooldown_end
+            logger.info(
+                f"🕐 {pair} | 平仓后设置 {self.COOLDOWN_HOURS}h 冷却期，"
+                f"至 {cooldown_end.strftime('%H:%M')}"
+            )
 
         except Exception as e:
             logger.error(f"生成交易复盘失败: {e}", exc_info=True)
@@ -623,6 +693,15 @@ class LLMFunctionStrategy(IStrategy):
         开仓信号 - 由LLM决策
         """
         pair = metadata["pair"]
+
+        # === 学术论文整合: 更新组合风险管理器的余额 ===
+        if self.portfolio_risk_manager and self.wallets:
+            try:
+                current_balance = self.wallets.get_total('USDT')
+                if current_balance > 0:
+                    self.portfolio_risk_manager.update_balance(current_balance)
+            except Exception as e:
+                logger.debug(f"更新组合风险管理器余额失败: {e}")
 
         # 默认不开仓
         dataframe.loc[:, "enter_long"] = 0
@@ -719,6 +798,18 @@ class LLMFunctionStrategy(IStrategy):
                     rsi_value = signal.get("rsi_value", 0)
                     trend_strength = signal.get("trend_strength", "未知")
                     stake_amount = signal.get("stake_amount")
+
+                    # 🛡️ 置信度门槛过滤（硬编码 80）
+                    MIN_CONFIDENCE_THRESHOLD = 80
+                    if action in ["enter_long", "enter_short"]:
+                        if confidence_score < MIN_CONFIDENCE_THRESHOLD:
+                            logger.warning(
+                                f"⚠️ {pair} | 置信度 {confidence_score} < {MIN_CONFIDENCE_THRESHOLD}, "
+                                f"信号被过滤，转为 signal_wait"
+                            )
+                            # 清空信号，不开仓
+                            self.trading_tools.clear_signal_for_pair(pair)
+                            return dataframe
 
                     if stake_amount and stake_amount > 0:
                         self._stake_request_cache[pair] = stake_amount
@@ -933,8 +1024,6 @@ class LLMFunctionStrategy(IStrategy):
                             )
 
                             # 计算持仓时长（分钟）
-                            from datetime import datetime, timezone
-
                             now = (
                                 datetime.utcnow()
                                 if trade.open_date.tzinfo is None
@@ -1063,6 +1152,10 @@ class LLMFunctionStrategy(IStrategy):
         - 移除RSI条件：RSI极端在强趋势中可能持续，不应作为止盈信号
         - 改为趋势强度检查：ADX<20或(ADX<25且MACD柱状图<0)表示趋势减弱
 
+        新增（2025-11-27）：
+        - 最小持仓时间检查：软性警告 + 可选硬约束
+        - 解决短持仓（<60分钟）导致亏损严重的问题
+
         杠杆处理：
         - 阈值直接表示ROI百分比 (current_profit已包含杠杆效应)
         - 例如：10x杠杆下，8%价格波动 = 80% ROI
@@ -1071,6 +1164,45 @@ class LLMFunctionStrategy(IStrategy):
             止盈理由字符串,或None(交给LLM决策)
         """
         try:
+            # 获取配置
+            exit_config = self.config.get("custom_exit_config", {})
+
+            # ============ 🛡️ 最小持仓时间硬约束（优先使用类属性硬编码值） ============
+            # 硬编码值优先于配置，确保最小持仓保护始终生效
+            min_holding_minutes = self.MIN_HOLDING_MINUTES  # 硬编码 90 分钟
+            exception_loss_pct = self.MIN_HOLDING_EXCEPTION_LOSS_PCT  # 硬编码 -8%
+            min_holding_log_warning = exit_config.get("min_holding_log_warning", True)
+
+            # 计算持仓时间
+            if hasattr(trade, "open_date_utc") and trade.open_date_utc:
+                holding_duration = current_time - trade.open_date_utc
+                holding_minutes = holding_duration.total_seconds() / 60
+            else:
+                holding_minutes = 0
+
+            # 检查是否处于短持仓期间
+            is_short_holding = holding_minutes < min_holding_minutes
+
+            if is_short_holding:
+                # 软性警告：记录短持仓情况
+                if min_holding_log_warning:
+                    logger.warning(
+                        f"[短持仓警告] {pair} | 持仓仅 {holding_minutes:.1f} 分钟 "
+                        f"(< {min_holding_minutes}分钟) | ROI: {current_profit * 100:.2f}%"
+                    )
+
+                # 🛡️ 硬约束检查（始终启用 - 硬编码）
+                # 例外情况：亏损超过阈值（如-8%）时允许提前退出
+                is_severe_loss = current_profit < exception_loss_pct
+                if not is_severe_loss:
+                    logger.info(
+                        f"🛡️ {pair} | 持仓 {holding_minutes:.0f}分钟 < {min_holding_minutes}分钟，"
+                        f"盈亏 {current_profit*100:.2f}% > {exception_loss_pct*100:.0f}%，"
+                        f"禁止退出（非止损情况）"
+                    )
+                    return None  # 阻止LLM退出决策
+
+            # ============ 原有的极端止盈保护逻辑 ============
             # 获取技术指标
             dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
             if dataframe.empty:
@@ -1081,9 +1213,6 @@ class LLMFunctionStrategy(IStrategy):
             macd = latest.get("macd", 0)
             macd_signal = latest.get("macd_signal", 0)
             macd_hist = macd - macd_signal  # MACD柱状图
-
-            # 获取配置
-            exit_config = self.config.get("custom_exit_config", {})
             # 阈值直接表示ROI百分比 (current_profit已包含杠杆效应)
             extreme_profit_threshold = exit_config.get(
                 "extreme_profit_threshold", 0.80
@@ -1365,14 +1494,15 @@ class LLMFunctionStrategy(IStrategy):
                     llm_exit_reason = f"[部分平仓 {exit_pct:.0f}%] {reason}"
 
                     # === 6. 写入日志 ===
+                    # 使用统一后的时间对象（已在1325-1330行统一时区）
                     self.experience_manager.log_trade_completion(
                         trade_id=trade.id,
                         pair=pair,
                         side="short" if trade.is_short else "long",
-                        entry_time=trade.open_date,
+                        entry_time=open_time,  # ✅ 使用统一后的 open_time
                         entry_price=trade.open_rate,
                         entry_reason=getattr(trade, "enter_tag", "") or "未记录",
-                        exit_time=current_time,
+                        exit_time=current_time,  # ✅ 使用统一后的 current_time
                         exit_price=current_rate,
                         exit_reason=llm_exit_reason,  # ✅ 使用 LLM 生成的原因
                         profit_pct=current_profit

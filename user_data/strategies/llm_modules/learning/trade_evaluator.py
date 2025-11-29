@@ -5,6 +5,7 @@
 from typing import Dict, Any, Optional
 from datetime import datetime
 import logging
+from llm_modules.utils.datetime_utils import normalize_timestamps
 
 logger = logging.getLogger(__name__)
 
@@ -340,6 +341,9 @@ class TradeEvaluator:
         """
         score = 50.0
 
+        # 统一时区
+        entry_time, exit_time = normalize_timestamps(entry_time, exit_time)
+        
         # 计算持仓时长
         duration_hours = (exit_time - entry_time).total_seconds() / 3600
 
@@ -468,6 +472,8 @@ class TradeEvaluator:
 
         return total_reward
 
+    # TODO: 未集成到主流程 - 考虑实现集成或在未来版本中移除
+    # 功能描述: 聚合多笔交易评价，生成统计摘要
     def get_evaluation_summary(self, evaluations: list) -> Dict[str, Any]:
         """
         获取评价摘要统计

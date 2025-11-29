@@ -4,6 +4,7 @@
 """
 import logging
 import re
+from datetime import datetime
 from typing import List, Dict, Any, Tuple
 from collections import defaultdict, Counter
 
@@ -152,7 +153,6 @@ class PatternAnalyzer:
             entry_time = t.get('entry_time', '')
             if entry_time:
                 try:
-                    from datetime import datetime
                     dt = datetime.fromisoformat(entry_time)
                     hour = dt.hour
                     if 22 <= hour or hour <= 2:  # 22:00-02:00
@@ -267,8 +267,6 @@ class PatternAnalyzer:
         Returns:
             时间模式统计
         """
-        from datetime import datetime
-
         hour_performance = defaultdict(list)
 
         for t in trades:

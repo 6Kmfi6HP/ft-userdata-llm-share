@@ -34,6 +34,7 @@ env/
 # Freqtrade 敏感数据
 user_data/logs/*.log
 user_data/logs/*.jsonl
+user_data/logs
 user_data/logs/reward_learning.json
 user_data/*.sqlite*
 user_data/*.sqlite*-journal

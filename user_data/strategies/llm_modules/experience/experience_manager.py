@@ -6,6 +6,7 @@ import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from collections import defaultdict
+from llm_modules.utils.datetime_utils import normalize_timestamps
 import copy
 
 logger = logging.getLogger(__name__)
@@ -155,6 +156,9 @@ class ExperienceManager:
                     entry_time = datetime.fromisoformat(entry_time)
                 if isinstance(exit_time, str):
                     exit_time = datetime.fromisoformat(exit_time)
+                
+                # 统一时区
+                entry_time, exit_time = normalize_timestamps(entry_time, exit_time)
 
                 duration_minutes = int((exit_time - entry_time).total_seconds() / 60)
 
@@ -223,6 +227,9 @@ class ExperienceManager:
                     entry_time = datetime.fromisoformat(entry_time)
                 if isinstance(exit_time, str):
                     exit_time = datetime.fromisoformat(exit_time)
+                
+                # 统一时区
+                entry_time, exit_time = normalize_timestamps(entry_time, exit_time)
 
                 # 交易评价
                 evaluation = self.trade_evaluator.evaluate_trade(

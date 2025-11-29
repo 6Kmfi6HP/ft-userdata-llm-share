@@ -268,7 +268,9 @@ class LLMClient:
                 "messages": messages,
                 "tools": [{"type": "function", "function": f} for f in functions]
             }
-            
+            # Gemini 模型特殊配置: 启用思考模式
+            if self.model.startswith("gemini-"):
+                payload["extra_body"] = {"google": {"thinking_config": {"thinking_budget": 24576, "include_thoughts": True}}}
             # 强制要求调用函数 (模型兼容性检查)
             # OpenAI: 使用 "required" (标准模式)
             payload["tool_choice"] = "required"

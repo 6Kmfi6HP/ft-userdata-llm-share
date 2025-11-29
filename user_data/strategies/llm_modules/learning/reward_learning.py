@@ -119,6 +119,8 @@ class RewardLearningSystem:
         if len(self.reward_history) % 10 == 0:
             self._save_history()
 
+    # TODO: 未集成到主流程 - 考虑实现集成或在未来版本中移除
+    # 功能描述: 根据历史奖励记录，为当前决策提供学习指导
     def get_learning_guidance(
         self,
         current_context: Dict[str, Any],
@@ -195,6 +197,8 @@ class RewardLearningSystem:
 
         return guidance
 
+    # TODO: 未集成到主流程 - 考虑实现集成或在未来版本中移除
+    # 功能描述: 获取奖励趋势统计，分析交易表现变化
     def get_reward_trend(self, window_size: int = 20) -> Dict[str, Any]:
         """
         获取奖励趋势
@@ -233,6 +237,8 @@ class RewardLearningSystem:
             'recent_grades': [r['grade'] for r in recent_records[-5:]]
         }
 
+    # TODO: 未集成到主流程 - 考虑实现集成或在未来版本中移除
+    # 功能描述: 生成完整的学习报告，包含成功/失败模式分析
     def generate_learning_report(self) -> str:
         """
         生成学习报告
@@ -412,6 +418,8 @@ class RewardLearningSystem:
         except Exception as e:
             logger.error(f"加载奖励历史失败: {e}")
 
+    # TODO: 未集成到主流程 - 考虑实现集成或在未来版本中移除
+    # 功能描述: 清空奖励历史数据
     def clear_history(self):
         """清空历史数据"""
         self.reward_history.clear()

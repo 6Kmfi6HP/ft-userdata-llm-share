@@ -50,6 +50,48 @@ class IndicatorCalculator:
         dataframe['macd_signal'] = macd['macdsignal']
         dataframe['macd_hist'] = macd['macdhist']
 
+        # ROC (Rate of Change) - 14日动量
+        # 基于学术论文: Begušić & Kostanjčar 2019 "Momentum and Liquidity in Cryptocurrencies"
+        dataframe['roc_14'] = ta.ROC(dataframe, timeperiod=14)
+
+        return dataframe
+
+    @staticmethod
+    def add_liquidity_indicators(dataframe: pd.DataFrame) -> pd.DataFrame:
+        """
+        添加流动性指标
+
+        基于学术论文: Begušić & Kostanjčar 2019
+        Amihud非流动性指标: |收益率| / 成交量
+        高Amihud值 = 低流动性
+
+        Args:
+            dataframe: OHLCV数据
+
+        Returns:
+            添加了流动性指标的DataFrame
+        """
+        # 确保依赖列存在 (volma_20 由 add_volume_indicators 添加)
+        if 'volma_20' not in dataframe.columns:
+            dataframe['volma_20'] = ta.SMA(dataframe['volume'], timeperiod=20)
+        
+        # 计算日收益率
+        dataframe['daily_return'] = dataframe['close'].pct_change()
+
+        # Amihud 非流动性指标
+        # 公式: Amihud = |return| / volume (缩放后)
+        volume_scaled = dataframe['volume'] / 1e6  # 缩放到百万单位
+        # 避免除零
+        volume_safe = volume_scaled.replace(0, 1e-10)
+        dataframe['amihud_raw'] = abs(dataframe['daily_return']) / volume_safe
+
+        # 14日滚动平均
+        dataframe['amihud_14'] = dataframe['amihud_raw'].rolling(window=14).mean()
+
+        # 流动性排名指标 (越高流动性越好，与amihud相反)
+        # 使用成交量相对于均值的比率
+        dataframe['liquidity_ratio'] = dataframe['volume'] / dataframe['volma_20'].replace(0, 1)
+
         return dataframe
 
     @staticmethod
@@ -123,5 +165,7 @@ class IndicatorCalculator:
         dataframe = IndicatorCalculator.add_volatility_indicators(dataframe)
         dataframe = IndicatorCalculator.add_trend_strength_indicators(dataframe)
         dataframe = IndicatorCalculator.add_volume_indicators(dataframe)
+        # 流动性指标依赖 volma_20，需在volume指标之后添加
+        dataframe = IndicatorCalculator.add_liquidity_indicators(dataframe)
 
         return dataframe
