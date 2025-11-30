@@ -221,7 +221,8 @@ class HistoricalQueryEngine:
         trades = self.query_recent_trades(pair=pair, limit=limit)
 
         if not trades:
-            return f"【{pair} 历史经验】\n暂无历史交易记录"
+            # return f"【{pair} 历史经验】\n暂无历史交易记录"
+            return ""
 
         lines = [f"【{pair} 最近{len(trades)}笔交易】"]
 
@@ -336,7 +337,8 @@ class HistoricalQueryEngine:
         summary = self.get_pair_summary(pair, days)
 
         if summary['total_trades'] == 0:
-            return f"【{pair} 统计】暂无历史数据"
+            # return f"【{pair} 统计】暂无历史数据"
+            return ""
 
         lines = [
             f"【{pair} 近{days}天统计】",

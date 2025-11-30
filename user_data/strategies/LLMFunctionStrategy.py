@@ -323,6 +323,37 @@ class LLMFunctionStrategy(IStrategy):
             f"✓ 交易工具: {len(self.function_executor.list_functions())} 个函数可用"
         )
 
+        # 启动清算数据追踪器（WebSocket后台收集）
+        try:
+            # 获取配置的交易对列表
+            trading_pairs = self.config.get("exchange", {}).get("pair_whitelist", [])
+            if trading_pairs and hasattr(self.context_builder, "sentiment"):
+                # 转换为Binance格式的symbol（如 BTC/USDT:USDT -> BTCUSDT）
+                symbols = []
+                for pair in trading_pairs:
+                    # 处理期货格式 BTC/USDT:USDT -> BTCUSDT
+                    symbol = pair.replace("/", "").replace(":USDT", "")
+                    symbols.append(symbol)
+
+                self.context_builder.sentiment.start_liquidation_tracker(symbols)
+                logger.info(f"✓ 清算数据追踪器已启动，监控 {len(symbols)} 个交易对")
+        except Exception as e:
+            logger.warning(f"启动清算数据追踪器失败: {e}")
+
+    def bot_cleanup(self) -> None:
+        """
+        策略清理时调用（Bot关闭前）
+        """
+        logger.info("正在清理策略资源...")
+
+        # 停止清算数据追踪器
+        try:
+            if hasattr(self, "context_builder") and hasattr(self.context_builder, "sentiment"):
+                self.context_builder.sentiment.stop_liquidation_tracker()
+                logger.info("✓ 清算数据追踪器已停止")
+        except Exception as e:
+            logger.warning(f"停止清算数据追踪器失败: {e}")
+
     def confirm_trade_entry(
         self,
         pair: str,
@@ -799,7 +830,7 @@ class LLMFunctionStrategy(IStrategy):
                     trend_strength = signal.get("trend_strength", "未知")
                     stake_amount = signal.get("stake_amount")
 
-                    # 🛡️ 置信度门槛过滤（硬编码 80）
+                    # 🛡️ 置信度门槛过滤（硬编码 70）
                     MIN_CONFIDENCE_THRESHOLD = 80
                     if action in ["enter_long", "enter_short"]:
                         if confidence_score < MIN_CONFIDENCE_THRESHOLD:

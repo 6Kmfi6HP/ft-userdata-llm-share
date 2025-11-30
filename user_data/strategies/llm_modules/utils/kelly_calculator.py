@@ -207,10 +207,12 @@ class KellyCalculator:
             return ""
 
         if not suggestion.get("valid"):
-            return f"【Kelly建议】{suggestion.get('message', '数据不足')}"
+            logger.debug(f"[Kelly] 无效建议: {suggestion.get('message', '数据不足')}")
+            # return f"【Kelly建议】{suggestion.get('message', '数据不足')}"
+            return ""
 
         lines = [
-            "【Kelly建议仓位】",
+            "【建议仓位】",
             f"  历史胜率: {suggestion['win_rate']:.1%} ({suggestion['total_trades']}笔)",
             f"  盈亏比: {suggestion['profit_factor']:.2f} (平均盈利{suggestion['avg_win_pct']:.1f}%/平均亏损{suggestion['avg_loss_pct']:.1f}%)",
             f"  Kelly比例: {suggestion['kelly_fraction_pct']:.1f}%{'(半Kelly)' if suggestion['use_half_kelly'] else ''}",
