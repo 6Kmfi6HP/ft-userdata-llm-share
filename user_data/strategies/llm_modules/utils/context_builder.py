@@ -15,8 +15,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from context.data_formatter import DataFormatter
 from context.prompt_builder import PromptBuilder
-# 🔧 修复M6: 导入浮点比较容差常量
 from .stoploss_calculator import StoplossCalculator, PROFIT_EPSILON
+# 上次决策查询引擎
+from learning.decision_query import DecisionQueryEngine
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,8 @@ class ContextBuilder:
         stoploss_config: Optional[Dict[str, Any]] = None,
         hard_stoploss_pct: Optional[float] = None,
         kelly_calculator=None,
-        portfolio_risk_manager=None
+        portfolio_risk_manager=None,
+        decision_query_engine=None
     ):
         """
         初始化上下文构建器
@@ -45,17 +47,20 @@ class ContextBuilder:
             pattern_analyzer: 模式分析器实例（可选）
             tradable_balance_ratio: 可交易余额比例
             max_open_trades: 最大开仓数
-            stoploss_config: 止损配置（🔧 修复M8: 从配置读取利润阈值）
-            hard_stoploss_pct: 硬止损百分比（🔧 修复M9: 从策略读取硬止损值）
+            stoploss_config: 止损配置
+            hard_stoploss_pct: 硬止损百分比
             kelly_calculator: Kelly公式仓位计算器（可选）
             portfolio_risk_manager: 组合风险管理器（可选）
+            decision_query_engine: 决策查询引擎实例（可选，用于获取上次分析决策）
         """
         self.config = context_config
         # 学术论文整合: Kelly公式和组合风险管理
         self.kelly_calculator = kelly_calculator
         self.portfolio_risk_manager = portfolio_risk_manager
+        # 上次决策查询引擎
+        self.decision_query = decision_query_engine
+        self.include_previous_decision = context_config.get("include_previous_decision", True)
 
-        # 🔧 修复M8+M9: 存储止损相关配置
         self.stoploss_config = stoploss_config or {}
         self.profit_threshold_1 = self.stoploss_config.get('profit_thresholds', [0.02, 0.06, 0.15])[0]
         self.hard_stoploss_pct = hard_stoploss_pct if hard_stoploss_pct is not None else 6.0
@@ -392,6 +397,18 @@ class ContextBuilder:
             context_parts.extend(market_data_parts)
             context_parts.append("</market_data>")
 
+        # === 上次决策分析部分 ===
+        if self.include_previous_decision and self.decision_query:
+            try:
+                previous_decision_text = self.decision_query.format_previous_decision_for_context(pair)
+                if previous_decision_text:
+                    context_parts.append("")
+                    context_parts.append("<previous_decision>")
+                    context_parts.append(previous_decision_text)
+                    context_parts.append("</previous_decision>")
+            except Exception as e:
+                logger.warning(f"获取上次决策失败: {e}")
+
         # === 账户信息部分 ===
         account_parts = []
         if wallets:
@@ -511,9 +528,8 @@ class ContextBuilder:
                     position_parts.append(f"    持仓时间: {time_str}")
                     position_parts.append(f"    投入: {stake:.2f}U")
 
-                    # 添加动态止损位信息(第2层ATR追踪止损) - 使用统一的StoplossCalculator
+                    # 添加动态止损位信息(第2层ATR追踪止损)
                     try:
-                        # 🔧 修复M6+M8: 使用Epsilon容差 + 从配置读取阈值（而非硬编码2%）
                         if (profit_pct / 100) > (self.profit_threshold_1 + PROFIT_EPSILON):
                             atr = latest.get('atr', 0)
                             adx = latest.get('adx', 0)
@@ -558,7 +574,6 @@ class ContextBuilder:
                                 position_parts.append(f"    动态止损: {stop_price:.6f} (距离{distance_pct:.2f}%{enhancement_msg})")
                                 position_parts.append(f"      └─ 基于{level}利润区间 + ATR追踪 (平滑过渡)")
                             else:
-                                # 🔧 修复M9: 从配置读取硬止损百分比（而非硬编码6.0）
                                 # StoplossCalculator返回None，表示应使用硬止损
                                 if is_short:
                                     stop_price = open_rate * (1 + self.hard_stoploss_pct / 100)
@@ -567,7 +582,6 @@ class ContextBuilder:
                                 position_parts.append(f"    硬止损: {stop_price:.6f} (-{self.hard_stoploss_pct:.1f}%)")
                                 position_parts.append(f"      └─ 盈利≤{self.profit_threshold_1*100:.1f}%时使用交易所硬止损")
                         else:
-                            # 🔧 修复M9: 从配置读取硬止损百分比（而非硬编码6.0）
                             # 使用硬止损
                             if is_short:
                                 stop_price = open_rate * (1 + self.hard_stoploss_pct / 100)
@@ -959,13 +973,15 @@ class ContextBuilder:
             context_parts.append("</microstructure>")
 
         # 添加历史经验和模式分析（自我学习系统）
-        if self.enable_learning:
+        # 通过 max_recent_trades_context 配置控制，设为0则完全禁用历史交易显示
+        max_recent_trades = self.config.get("max_recent_trades_context", 10)
+        if self.enable_learning and max_recent_trades > 0:
             try:
                 context_parts.append("")
                 # 获取最近交易
                 recent_trades_text = self.historical_query.format_recent_trades_for_context(
                     pair=pair,
-                    limit=10
+                    limit=max_recent_trades
                 )
                 context_parts.append(recent_trades_text)
 
@@ -1010,6 +1026,190 @@ class ContextBuilder:
             持仓管理系统提示词字符串
         """
         return self.prompt_builder.build_position_prompt()
+
+    def build_exit_context(
+        self,
+        dataframe: pd.DataFrame,
+        metadata: Dict[str, Any],
+        trade: Any = None,
+        exit_metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        构建退出分析专用的市场上下文（轻量版）
+
+        用于 ExitReasonGenerator 生成退出原因时提供详细市场数据。
+        相比 build_market_context()，此方法不需要 wallets、exchange 等重依赖。
+
+        Args:
+            dataframe: OHLCV数据和技术指标
+            metadata: 交易对元数据 {'pair': 'BTC/USDT'}
+            trade: Freqtrade Trade 对象（可选）
+            exit_metadata: 退出触发元数据，如 {'exit_layer': 'layer2', 'trigger_profit': 0.15}
+
+        Returns:
+            格式化的退出分析上下文字符串
+        """
+        pair = metadata.get('pair', 'UNKNOWN')
+
+        if dataframe.empty:
+            return f"市场数据: {pair} - 无数据"
+
+        latest = dataframe.iloc[-1]
+        prev = dataframe.iloc[-2] if len(dataframe) > 1 else latest
+
+        # 获取K线时间
+        candle_time = latest.get('date', datetime.now(timezone.utc))
+        if hasattr(candle_time, 'strftime'):
+            candle_time_str = candle_time.strftime('%Y-%m-%d %H:%M:%S UTC')
+        else:
+            candle_time_str = str(candle_time)
+
+        context_parts = []
+
+        # === 价格信息 ===
+        context_parts.append("<price>")
+        context_parts.append(f"## 交易对: {pair}")
+        context_parts.append(f"K线时间: {candle_time_str}")
+        context_parts.append(f"当前价格: {latest['close']:.8f}")
+        context_parts.append(f"开盘: {latest['open']:.8f} | 最高: {latest['high']:.8f} | 最低: {latest['low']:.8f}")
+        price_change_pct = (latest['close'] - prev['close']) / prev['close'] * 100
+        context_parts.append(f"价格变化: {price_change_pct:+.2f}%")
+        context_parts.append("</price>")
+
+        # === 技术指标（按时间框架分组）===
+        excluded_cols = {'date', 'open', 'high', 'low', 'close', 'volume',
+                         'enter_long', 'enter_short', 'enter_tag',
+                         'exit_long', 'exit_short', 'exit_tag'}
+
+        indicators_30m = []
+        indicators_1h = []
+        indicators_4h = []
+
+        for col in latest.index:
+            if col in excluded_cols:
+                continue
+            value = latest[col]
+            if pd.isna(value):
+                continue
+
+            if '_1h' in col:
+                indicators_1h.append((col, value))
+            elif '_4h' in col:
+                indicators_4h.append((col, value))
+            elif not col.endswith('_1d'):  # 退出分析时日线权重较低，暂不包含
+                indicators_30m.append((col, value))
+
+        context_parts.append("")
+        context_parts.append("<indicators>")
+
+        if indicators_4h:
+            context_parts.append("### 4小时指标")
+            for ind, val in indicators_4h:
+                context_parts.append(f"  {ind}: {val:.4f}")
+
+        if indicators_1h:
+            context_parts.append("### 1小时指标")
+            for ind, val in indicators_1h:
+                context_parts.append(f"  {ind}: {val:.4f}")
+
+        if indicators_30m:
+            context_parts.append("### 30分钟指标")
+            for ind, val in indicators_30m:
+                context_parts.append(f"  {ind}: {val:.4f}")
+
+        context_parts.append("</indicators>")
+
+        # === 关键指标历史 ===
+        indicator_history = self.formatter.get_indicator_history(
+            dataframe,
+            lookback=min(self.indicator_history_lookback, 40),  # 退出分析使用较短历史
+            display_points=min(self.indicator_history_points, 20)
+        )
+        if indicator_history:
+            context_parts.append("")
+            context_parts.append("<indicator_history>")
+            context_parts.append("### 关键指标历史（最近20根K线）")
+            for ind_name, values in indicator_history.items():
+                if values and any(v is not None for v in values):
+                    values_str = ", ".join([f"{v}" if v is not None else "N/A" for v in values])
+                    context_parts.append(f"  {ind_name}: [{values_str}]")
+            context_parts.append("</indicator_history>")
+
+        # === 持仓信息（如有 trade 对象）===
+        if trade:
+            context_parts.append("")
+            context_parts.append("<position>")
+            context_parts.append("### 持仓信息")
+
+            is_short = getattr(trade, 'is_short', False)
+            open_rate = getattr(trade, 'open_rate', 0)
+            stake = getattr(trade, 'stake_amount', 0)
+            leverage = getattr(trade, 'leverage', 1)
+            enter_tag = getattr(trade, 'enter_tag', '')
+            open_date = getattr(trade, 'open_date', None)
+            current_price = latest['close']
+
+            # 计算盈亏
+            if is_short:
+                profit_pct = (open_rate - current_price) / open_rate * leverage * 100
+            else:
+                profit_pct = (current_price - open_rate) / open_rate * leverage * 100
+
+            # 计算持仓时间
+            time_str = "未知"
+            if open_date and isinstance(open_date, datetime):
+                now = datetime.utcnow() if open_date.tzinfo is None else datetime.now(timezone.utc)
+                holding_time = now - open_date
+                hours = holding_time.total_seconds() / 3600
+                if hours < 1:
+                    time_str = f"{int(hours * 60)}分钟"
+                elif hours < 24:
+                    time_str = f"{hours:.1f}小时"
+                else:
+                    time_str = f"{hours / 24:.1f}天"
+
+            context_parts.append(f"  方向: {'做空' if is_short else '做多'} {leverage}x杠杆")
+            context_parts.append(f"  开仓价: {open_rate:.6f}")
+            context_parts.append(f"  当前价: {current_price:.6f}")
+            context_parts.append(f"  当前盈亏: {profit_pct:+.2f}%")
+            context_parts.append(f"  持仓时间: {time_str}")
+            context_parts.append(f"  投入: {stake:.2f} USDT")
+
+            if enter_tag:
+                context_parts.append(f"  开仓理由: {enter_tag[:200]}...")
+
+            context_parts.append("</position>")
+
+        # === 退出触发元数据 ===
+        if exit_metadata:
+            context_parts.append("")
+            context_parts.append("<exit_trigger>")
+            context_parts.append("### 退出触发信息")
+
+            exit_layer = exit_metadata.get('exit_layer', 'unknown')
+            trigger_profit = exit_metadata.get('trigger_profit', 0) * 100
+
+            if exit_layer == 'layer2':
+                profit_zone = exit_metadata.get('profit_zone', 'unknown')
+                atr_multiplier = exit_metadata.get('atr_multiplier', 1.0)
+                context_parts.append(f"  触发层: Layer 2 (ATR追踪止损)")
+                context_parts.append(f"  盈利区间: {profit_zone}")
+                context_parts.append(f"  触发时ROI: {trigger_profit:.1f}%")
+                context_parts.append(f"  ATR倍数: {atr_multiplier}x")
+            elif exit_layer == 'layer1':
+                context_parts.append(f"  触发层: Layer 1 (交易所硬止损 -10%)")
+                context_parts.append(f"  触发时ROI: {trigger_profit:.1f}%")
+            elif exit_layer == 'layer4':
+                rsi_value = exit_metadata.get('rsi_value', 0)
+                adx_value = exit_metadata.get('adx_value', 0)
+                context_parts.append(f"  触发层: Layer 4 (极端止盈保护)")
+                context_parts.append(f"  触发时ROI: {trigger_profit:.1f}%")
+                context_parts.append(f"  RSI: {rsi_value:.1f}")
+                context_parts.append(f"  ADX: {adx_value:.1f}")
+
+            context_parts.append("</exit_trigger>")
+
+        return "\n".join(context_parts)
 
     def build_decision_request(
         self,

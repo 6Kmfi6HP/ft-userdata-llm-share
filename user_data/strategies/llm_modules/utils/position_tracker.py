@@ -78,7 +78,7 @@ class PositionTracker:
         if profit_pct > pos['profit_peak']:
             pos['profit_peak'] = profit_pct
 
-        # 记录决策
+        # 记录决策（仅记录实际决策，不记录价格更新）
         if decision_type == 'hold':
             pos['hold_count'] += 1
             pos['hold_reasons'].append({
@@ -87,13 +87,15 @@ class PositionTracker:
                 'profit_at_hold': profit_pct
             })
 
-        pos['decision_history'].append({
-            'time': datetime.now(),
-            'type': decision_type,
-            'price': current_price,
-            'profit_pct': profit_pct,
-            'reason': decision_reason[:200]  # 限制长度避免存储过大
-        })
+        # 只有实际决策才记录到 decision_history（排除 price_update）
+        if decision_type != 'price_update':
+            pos['decision_history'].append({
+                'time': datetime.now(),
+                'type': decision_type,
+                'price': current_price,
+                'profit_pct': profit_pct,
+                'reason': decision_reason[:200] if decision_reason else ""
+            })
 
         # 添加价格快照
         pos['price_snapshots'].append({

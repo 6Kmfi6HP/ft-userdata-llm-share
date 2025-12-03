@@ -23,6 +23,53 @@ class TradingTools:
         """
         self.strategy = strategy_instance
         self._signal_cache = {}  # 缓存本周期的信号
+        self._skip_confidence_check = False  # 共识模式下跳过置信度检查
+
+        # 信号反转配置
+        self._signal_reversal_config = self._load_signal_reversal_config()
+
+    def _load_signal_reversal_config(self) -> Dict[str, Any]:
+        """加载信号反转配置"""
+        default_config = {
+            "enabled": False,
+            "reverse_entry_only": True,  # 仅反转入场信号
+            "pair_whitelist": None,       # 反转白名单（None=全部）
+            "pair_blacklist": [],         # 反转黑名单
+            "log_reversal": True          # 记录反转日志
+        }
+
+        config = getattr(self.strategy, 'config', {})
+        user_config = config.get("signal_reversal_config", {})
+
+        # 合并配置
+        for key, value in user_config.items():
+            if key in default_config:
+                default_config[key] = value
+
+        if default_config["enabled"]:
+            logger.warning("⚠️ 信号反转模式已启用 - LLM入场信号将被反转执行")
+
+        return default_config
+
+    def set_skip_confidence_check(self, skip: bool):
+        """设置是否跳过置信度检查（供共识客户端使用）"""
+        self._skip_confidence_check = skip
+
+    def update_signal_confidence(self, pair: str, new_confidence: float, new_reason: str = None):
+        """
+        更新信号的置信度（供共识客户端使用）
+
+        Args:
+            pair: 交易对
+            new_confidence: 新的置信度值
+            new_reason: 新的理由（可选）
+        """
+        if pair in self._signal_cache:
+            self._signal_cache[pair]["confidence_score"] = new_confidence
+            self._signal_cache[pair]["consensus_confidence"] = new_confidence
+            if new_reason:
+                self._signal_cache[pair]["reason"] = new_reason
+            logger.debug(f"已更新 {pair} 信号置信度为 {new_confidence}")
 
     def get_tools_schema(self) -> list[Dict[str, Any]]:
         """获取所有交易工具的OpenAI函数schema"""
@@ -277,8 +324,8 @@ class TradingTools:
             if stake_amount is not None and stake_amount <= 0:
                 return {"success": False, "message": "投入金额必须大于0"}
 
-            # 置信度门槛验证
-            if confidence_score < self.MIN_CONFIDENCE_THRESHOLD:
+            # 置信度门槛验证（共识模式下跳过，由共识客户端后置验证）
+            if not self._skip_confidence_check and confidence_score < self.MIN_CONFIDENCE_THRESHOLD:
                 return {
                     "success": False,
                     "message": f"置信度{confidence_score}低于{self.MIN_CONFIDENCE_THRESHOLD}门槛，"
@@ -367,8 +414,8 @@ class TradingTools:
             if stake_amount is not None and stake_amount <= 0:
                 return {"success": False, "message": "投入金额必须大于0"}
 
-            # 置信度门槛验证
-            if confidence_score < self.MIN_CONFIDENCE_THRESHOLD:
+            # 置信度门槛验证（共识模式下跳过，由共识客户端后置验证）
+            if not self._skip_confidence_check and confidence_score < self.MIN_CONFIDENCE_THRESHOLD:
                 return {
                     "success": False,
                     "message": f"置信度{confidence_score}低于{self.MIN_CONFIDENCE_THRESHOLD}门槛，"
@@ -623,8 +670,107 @@ class TradingTools:
             return {"success": False, "message": str(e)}
 
     def get_signal(self, pair: str) -> Optional[Dict[str, Any]]:
-        """获取缓存的信号"""
-        return self._signal_cache.get(pair)
+        """
+        获取缓存的信号（支持信号反转）
+
+        Args:
+            pair: 交易对
+
+        Returns:
+            信号字典（可能已反转）或 None
+        """
+        signal = self._signal_cache.get(pair)
+
+        if signal and self._should_reverse_signal(pair, signal):
+            signal = self._apply_signal_reversal(pair, signal)
+
+        return signal
+
+    def _should_reverse_signal(self, pair: str, signal: Dict[str, Any]) -> bool:
+        """
+        判断是否应该反转信号
+
+        Args:
+            pair: 交易对
+            signal: 原始信号
+
+        Returns:
+            是否应该反转
+        """
+        config = self._signal_reversal_config
+
+        # 总开关未启用
+        if not config.get("enabled", False):
+            return False
+
+        action = signal.get("action", "")
+
+        # 仅反转入场信号模式
+        if config.get("reverse_entry_only", True):
+            if action not in ["enter_long", "enter_short"]:
+                return False
+
+        # 检查交易对白名单
+        whitelist = config.get("pair_whitelist")
+        if whitelist is not None and pair not in whitelist:
+            return False
+
+        # 检查交易对黑名单（在黑名单中的不反转）
+        blacklist = config.get("pair_blacklist", [])
+        if pair in blacklist:
+            return False
+
+        return True
+
+    def _apply_signal_reversal(self, pair: str, signal: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        应用信号反转
+
+        Args:
+            pair: 交易对
+            signal: 原始信号
+
+        Returns:
+            反转后的信号
+        """
+        action = signal.get("action", "")
+
+        # 反转映射
+        reversal_map = {
+            "enter_long": "enter_short",
+            "enter_short": "enter_long",
+            "exit": "exit",      # 平仓信号不反转
+            "hold": "hold",      # 持仓不变
+            "wait": "wait"       # 等待不变
+        }
+
+        new_action = reversal_map.get(action, action)
+
+        if new_action == action:
+            return signal  # 无需反转
+
+        # 创建反转后的信号副本
+        reversed_signal = signal.copy()
+        reversed_signal["action"] = new_action
+        reversed_signal["_original_action"] = action  # 保留原始动作用于日志
+        reversed_signal["_reversed"] = True
+
+        # 记录反转日志
+        if self._signal_reversal_config.get("log_reversal", True):
+            logger.warning(
+                f"🔄 [信号反转] {pair}: {action} → {new_action} | "
+                f"原因: {signal.get('reason', 'N/A')[:50]}..."
+            )
+
+        return reversed_signal
+
+    def is_signal_reversal_enabled(self) -> bool:
+        """检查信号反转是否启用"""
+        return self._signal_reversal_config.get("enabled", False)
+
+    def get_signal_reversal_config(self) -> Dict[str, Any]:
+        """获取信号反转配置（用于日志和调试）"""
+        return self._signal_reversal_config.copy()
 
     def clear_signal_for_pair(self, pair: str):
         """

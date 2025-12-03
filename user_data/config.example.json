@@ -38,7 +38,7 @@
     "force_exit": "market",
     "force_entry": "market",
     "stoploss": "market",
-    "stoploss_on_exchange": false
+    "stoploss_on_exchange": true
   },
   "trailing_stop": false,
   "exchange": {
@@ -190,6 +190,12 @@
       "use_entry_step0_gate": true,
       "use_rule_id_system": true,
       "use_shared_definitions": true
+    },
+    "consensus_config": {
+      "enabled": false,
+      "parallel_requests": true,
+      "conflict_strategy": "conservative",
+      "require_consensus": false
     }
   },
   "risk_management": {
@@ -236,29 +242,34 @@
       "adx"
     ],
     "multi_timeframe_history": {},
-    "include_multi_timeframe_data": false
+    "include_multi_timeframe_data": false,
+    "include_previous_decision": true,
+    "previous_decision_max_age_hours": 24,
+    "previous_decision_max_chars": 1500
   },
   "custom_stoploss_config": {
     "profit_thresholds": [0.02, 0.06, 0.15],
-    "atr_multipliers": [1.5, 1.0, 0.8],
-    "min_distances": [0.004, 0.0025, 0.002],
+    "atr_multipliers": [1.5, 1.0, 2.0],
+    "min_distances": [0.015, 0.020, 0.030],
     "time_decay_hours": 2,
     "time_decay_factor": 0.8,
     "trend_strength_threshold": 25,
     "trend_strength_factor": 1.2,
     "use_smooth_transition": true,
-    "max_atr_pct": 0.1,
+    "max_atr_pct": 0.10,
     "trend_priority": true,
     "direction_tolerance": 0.0001,
-    "min_stop_distance": 0.0001,
-    "max_stop_distance": 0.5
+    "min_stop_distance": 0.001,
+    "max_stop_distance": 0.50
   },
   "custom_exit_config": {
-    "extreme_profit_threshold": 0.5,
-    "extreme_rsi_threshold": 90,
-    "exceptional_profit_threshold": 0.7,
+    "extreme_profit_threshold": 0.80,
+    "trend_weak_threshold": 20,
+    "trend_weak_confirmation": 25,
+    "exceptional_profit_threshold": 1.00,
     "use_leverage_adjusted_thresholds": false,
-    "profit_epsilon": 0.001
+    "profit_epsilon": 0.001,
+    "min_holding_log_warning": true
   },
   "exit_reason_generation": {
     "enabled": true,
@@ -266,5 +277,12 @@
     "temperature": 0.3,
     "max_tokens": 500,
     "fallback_on_error": true
+  },
+  "signal_reversal_config": {
+    "enabled": false,
+    "reverse_entry_only": true,
+    "pair_whitelist": null,
+    "pair_blacklist": [],
+    "log_reversal": true
   }
 }

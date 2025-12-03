@@ -1,13 +1,6 @@
 """
 提示词构建器模块
-负责从外部 markdown 文件加载 LLM 系统提示词
-
-重构历史：
-- 2025-11-29: 重构为文件加载模式
-  * 提示词从 user_data/prompts/{template}/ 目录加载
-  * 支持多套模板切换（通过 template_name 参数）
-  * 保留 StrategyConfig 用于模板变量替换
-  * 移除所有硬编码的 _build_* 方法
+从 user_data/prompts/{template}/ 目录加载 LLM 系统提示词
 """
 
 import logging
@@ -85,7 +78,7 @@ class PromptBuilder:
 
     def __init__(
         self,
-        template_name: str = "default_old",
+        template_name: str = "default_nothing",
         include_timeframe_guidance: bool = True,
         config: Optional[Dict[str, Any]] = None,
     ):
