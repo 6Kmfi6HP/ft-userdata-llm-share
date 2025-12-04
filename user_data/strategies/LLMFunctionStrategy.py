@@ -67,10 +67,10 @@ class LLMFunctionStrategy(IStrategy):
     # 策略基本配置
     INTERFACE_VERSION = 3
     can_short = True
-    timeframe = "30m"  # 30分钟K线，减少噪音，提高信号质量
+    timeframe = "15m"  # 15分钟K线，更细粒度的数据
 
     # 启动需要的历史数据
-    startup_candle_count = 500  # 30分钟*500 = 约10.4天数据（确保EMA200稳定）
+    startup_candle_count = 1000  # 15分钟*1000 = 约10.4天数据（确保EMA200稳定）
 
     # 启用分层止损保护：硬止损 + 动态追踪止损 + LLM 决策
     stoploss = (
@@ -89,7 +89,7 @@ class LLMFunctionStrategy(IStrategy):
     }
 
     # 最小持仓时间硬约束
-    MIN_HOLDING_MINUTES = 120  # 最小持仓 120 分钟（4 根 K 线）
+    MIN_HOLDING_MINUTES = 120  # 最小持仓 120 分钟（8 根 15分钟 K 线）
     MIN_HOLDING_EXCEPTION_LOSS_PCT = -0.08  # 仅 -8% 以上亏损可提前退出
 
     def __init__(self, config: dict) -> None:
@@ -205,6 +205,16 @@ class LLMFunctionStrategy(IStrategy):
             self._stake_request_cache = {}
             self._model_score_cache = {}  # 存储模型对交易的自我评分
 
+            # 10.5 LLM调用节流状态（使用系统时间，仅live/dry_run生效）
+            self._last_llm_entry_call: Dict[str, datetime] = {}
+            self._last_llm_exit_call: Dict[str, datetime] = {}
+
+            # 从config加载节流间隔
+            throttle_config = config.get("llm_throttle_config", {})
+            self.llm_entry_interval = throttle_config.get("entry_interval_minutes", 60)
+            self.llm_exit_interval = throttle_config.get("exit_interval_minutes", 60)
+            logger.info(f"✓ LLM节流: 开仓间隔={self.llm_entry_interval}分钟, 平仓间隔={self.llm_exit_interval}分钟")
+
             # 11. 初始化增强模块
             self.position_tracker = PositionTracker()
             self.market_comparator = MarketStateComparator()
@@ -256,6 +266,57 @@ class LLMFunctionStrategy(IStrategy):
             return self.position_system_prompt
         else:
             return self.entry_system_prompt
+
+    def _should_run_llm_analysis(self, pair: str, analysis_type: str) -> bool:
+        """
+        检查是否应该运行LLM分析（基于时间间隔）
+        仅在live/dry_run模式生效，回测不节流
+
+        Args:
+            pair: 交易对
+            analysis_type: "entry" 或 "exit"
+
+        Returns:
+            True 如果应该运行LLM分析，False 如果应该跳过
+        """
+        # 回测模式不节流
+        runmode = self.config.get("runmode")
+        if runmode and runmode.value not in ("live", "dry_run"):
+            return True
+
+        now = datetime.now(timezone.utc)
+
+        if analysis_type == "entry":
+            interval = self.llm_entry_interval
+            cache = self._last_llm_entry_call
+        else:
+            interval = self.llm_exit_interval
+            cache = self._last_llm_exit_call
+
+        last_call = cache.get(pair)
+        if last_call is None:
+            return True  # 首次调用
+
+        elapsed = (now - last_call).total_seconds() / 60
+        if elapsed >= interval:
+            return True
+
+        logger.debug(f"⏳ {pair} | {analysis_type} 跳过 | {elapsed:.1f}分钟 < {interval}分钟")
+        return False
+
+    def _record_llm_call(self, pair: str, analysis_type: str) -> None:
+        """
+        记录LLM调用时间
+
+        Args:
+            pair: 交易对
+            analysis_type: "entry" 或 "exit"
+        """
+        now = datetime.now(timezone.utc)
+        if analysis_type == "entry":
+            self._last_llm_entry_call[pair] = now
+        else:
+            self._last_llm_exit_call[pair] = now
 
     def _register_all_tools(self):
         """注册所有工具函数（简化版 - 只注册交易控制工具）"""
@@ -709,7 +770,7 @@ class LLMFunctionStrategy(IStrategy):
         self, dataframe: pd.DataFrame, metadata: dict
     ) -> pd.DataFrame:
         """
-        计算技术指标（30分钟基础数据）- 使用统一的 IndicatorCalculator
+        计算技术指标（15分钟基础数据）- 使用统一的 IndicatorCalculator
         """
         return IndicatorCalculator.add_all_indicators(dataframe)
 
@@ -750,6 +811,10 @@ class LLMFunctionStrategy(IStrategy):
             pair_has_position = any(t.pair == pair for t in current_trades)
             if pair_has_position:
                 logger.debug(f"⏭️  {pair} | 已有持仓，跳过开仓分析")
+                return dataframe
+
+            # LLM调用节流检查（开仓分析）
+            if not self._should_run_llm_analysis(pair, "entry"):
                 return dataframe
 
             # 构建完整的市场上下文（包含技术指标、账户信息、持仓情况）
@@ -794,10 +859,18 @@ class LLMFunctionStrategy(IStrategy):
                 {"role": "user", "content": decision_request},
             ]
 
+            # 设置 OHLCV 数据供视觉分析 Agent 使用
+            if hasattr(self.llm_client, "set_current_ohlcv"):
+                self.llm_client.set_current_ohlcv(dataframe, self.timeframe, pair)
+
             response = self.llm_client.call_with_functions(
                 messages=messages,
                 max_iterations=10,  # 限制迭代次数，防止无限循环
             )
+
+            # 清除 OHLCV 缓存
+            if hasattr(self.llm_client, "clear_current_ohlcv"):
+                self.llm_client.clear_current_ohlcv()
 
             # 处理响应
             if response.get("success"):
@@ -879,6 +952,9 @@ class LLMFunctionStrategy(IStrategy):
                 # 🔧 修复C4: 清空当前交易对的信号缓存（避免竞态条件）
                 self.trading_tools.clear_signal_for_pair(pair)
 
+                # 记录LLM调用时间（用于节流）
+                self._record_llm_call(pair, "entry")
+
         except Exception as e:
             logger.error(f"开仓决策失败 {pair}: {e}")
 
@@ -911,6 +987,10 @@ class LLMFunctionStrategy(IStrategy):
             pair_has_position = any(t.pair == pair for t in current_trades)
             if not pair_has_position:
                 return dataframe  # 无持仓，不需要决策
+
+            # LLM调用节流检查（平仓分析）
+            if not self._should_run_llm_analysis(pair, "exit"):
+                return dataframe
 
             # 构建完整的市场上下文（包含技术指标、账户信息、持仓情况）
             # 获取exchange对象用于市场情绪数据
@@ -1002,10 +1082,18 @@ class LLMFunctionStrategy(IStrategy):
                 {"role": "user", "content": decision_request},
             ]
 
+            # 设置 OHLCV 数据供视觉分析 Agent 使用
+            if hasattr(self.llm_client, "set_current_ohlcv"):
+                self.llm_client.set_current_ohlcv(dataframe, self.timeframe, pair)
+
             response = self.llm_client.call_with_functions(
                 messages=messages,
                 max_iterations=10,  # 限制迭代次数，防止无限循环
             )
+
+            # 清除 OHLCV 缓存
+            if hasattr(self.llm_client, "clear_current_ohlcv"):
+                self.llm_client.clear_current_ohlcv()
 
             if response.get("success"):
                 llm_message = response.get("message", "")
@@ -1175,6 +1263,9 @@ class LLMFunctionStrategy(IStrategy):
 
                 # 🔧 修复C4: 清空当前交易对的信号缓存（避免竞态条件）
                 self.trading_tools.clear_signal_for_pair(pair)
+
+                # 记录LLM调用时间（用于节流）
+                self._record_llm_call(pair, "exit")
 
         except Exception as e:
             logger.error(f"平仓决策失败 {pair}: {e}")
@@ -1582,15 +1673,21 @@ class LLMFunctionStrategy(IStrategy):
         """
         第2层：ATR动态追踪止损 + 时间衰减 + 趋势适应
 
+        基于2024-2025加密货币ATR止损最佳实践优化：
+        - 来源: Flipster, LuxAlgo, TrendSpider, Freqtrade Docs
+        - 加密货币推荐止损距离: 8-15% (vs 股票3-5%)
+        - 避免1×ATR内止损 (防止whipsaw假突破震出)
+
         策略逻辑（使用平滑过渡避免跳变）：
-        - 盈利 ≤2%: 使用硬止损 -6% (self.stoploss)
-        - 盈利 2-6%: 追踪距离 = 1.5×ATR%, 最小1.5%
-        - 盈利 6-15%: 追踪距离 = 1.5x平滑过渡到1.0×ATR (线性插值)
-        - 盈利 >15%: 追踪距离 = 0.8×ATR%, 最小0.5%
+        - 盈利 ≤2%: 使用硬止损 (self.stoploss)
+        - 盈利 2-6%: 追踪距离 = 2.0×ATR, 最小4% (保护初始盈利)
+        - 盈利 6-15%: 追踪距离 = 2.0×ATR 平滑过渡, 最小5%
+        - 盈利 >15%: 追踪距离 = 3.0×ATR, 最小8% (让利润奔跑)
+        - 盈利 >80%: 追踪距离 = 4.0×ATR, 最小10% (极端放宽给Layer4)
 
         增强特性：
-        - 时间衰减: 持仓>2小时未达6%利润,收紧止损20%
-        - 趋势适应: ADX>25时,放宽追踪距离20%
+        - 时间衰减: 持仓>4小时未达6%利润,收紧止损15%
+        - 趋势适应: ADX>25时,放宽追踪距离25%
 
         返回值：
         - 相对于当前价格的止损百分比（负数），如 -0.05 表示当前价格下方5%
@@ -1695,27 +1792,32 @@ class LLMFunctionStrategy(IStrategy):
         #
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         if current_profit >= 0.80:
-            # 盈利>80%：大幅放宽止损，最小8%（从5%提高到8%），给 custom_exit 的趋势强度检查留出时间
-            # 如果 ATR 很小，使用固定8%的最小距离；否则使用 4.0×ATR（从3.0×ATR提高到4.0×ATR）
-            if atr_pct < 0.02:  # ATR < 2%
-                min_distance_for_high_profit = 0.08  # 固定8%（从5%提高到8%）
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # 盈利>80%：极端高盈利区间特殊处理
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # 【最佳实践】趋势市场应使用4.0×ATR，最小10-12%
+            # 目的：给 Layer 4 (custom_exit) 的趋势强度检查留出执行空间
+            # 让利润在强趋势中继续奔跑，避免过早被止损打出
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            if atr_pct < 0.025:  # ATR < 2.5%（低波动环境）
+                min_distance_for_high_profit = 0.10  # 固定10%
             else:
                 min_distance_for_high_profit = max(
-                    4.0 * atr_pct, 0.08
-                )  # 4.0×ATR，最小8%（从3.0×ATR提高到4.0×ATR）
+                    4.0 * atr_pct, 0.10
+                )  # 4.0×ATR，最小10%
 
-            # 临时覆盖配置中的最小距离，仅用于高盈利区间
+            # 临时覆盖配置中的最小距离，仅用于极端高盈利区间
             original_min_distances = custom_stoploss_config.get(
-                "min_distances", [0.015, 0.020, 0.030]
+                "min_distances", [0.04, 0.05, 0.08]  # 更新默认值匹配新配置
             )
             custom_stoploss_config["min_distances"] = [
                 original_min_distances[0],  # 2-6%区间保持不变
                 original_min_distances[1],  # 6-15%区间保持不变
-                min_distance_for_high_profit,  # >15%区间使用放宽后的值
+                min_distance_for_high_profit,  # >15%区间使用极端放宽值
             ]
             logger.debug(
                 f"[第2层-ATR止损] {pair} 盈利{current_profit * 100:.1f}% > 80%，"
-                f"放宽止损到最小{min_distance_for_high_profit * 100:.1f}%，给 custom_exit 留出执行空间并让利润奔跑"
+                f"放宽止损到{min_distance_for_high_profit * 100:.1f}%，让利润奔跑+给Layer4执行空间"
             )
 
         # 1. 计算目标止损价格（基于当前价格和ATR动态距离）

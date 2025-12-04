@@ -336,7 +336,7 @@ class ContextBuilder:
                         'exit_long', 'exit_short', 'exit_tag'}
 
         # 按时间框架分组
-        indicators_30m = []  # 改为30分钟
+        indicators_15m = []  # 主时间框架15分钟
         indicators_1h = []
         indicators_4h = []
         indicators_1d = []
@@ -357,10 +357,10 @@ class ContextBuilder:
             elif '_1d' in col:
                 indicators_1d.append((col, value))
             else:
-                indicators_30m.append((col, value))
+                indicators_15m.append((col, value))
 
         # 按照从大到小的时间框架顺序呈现（高时间框架更重要）
-        # 日线 > 4H > 1H > 30M
+        # 日线 > 4H > 1H > 15M
 
         # 输出日线指标 - 最高优先级，决定大势方向
         # if self.include_multi_timeframe_data and indicators_1d:
@@ -384,11 +384,11 @@ class ContextBuilder:
             for ind, val in indicators_1h:
                 market_data_parts.append(f"  {ind}: {val:.4f}")
 
-        # 输出30分钟指标 - 寻找入场时机
-        if indicators_30m:
+        # 输出15分钟指标 - 寻找入场时机
+        if indicators_15m:
             market_data_parts.append("")
-            market_data_parts.append("### 技术指标 - 30分钟（寻找入场时机）")
-            for ind, val in indicators_30m:
+            market_data_parts.append("### 技术指标 - 15分钟（寻找入场时机）")
+            for ind, val in indicators_15m:
                 market_data_parts.append(f"  {ind}: {val:.4f}")
 
         # 完成市场数据部分，添加到context_parts
@@ -1081,7 +1081,7 @@ class ContextBuilder:
                          'enter_long', 'enter_short', 'enter_tag',
                          'exit_long', 'exit_short', 'exit_tag'}
 
-        indicators_30m = []
+        indicators_15m = []
         indicators_1h = []
         indicators_4h = []
 
@@ -1097,7 +1097,7 @@ class ContextBuilder:
             elif '_4h' in col:
                 indicators_4h.append((col, value))
             elif not col.endswith('_1d'):  # 退出分析时日线权重较低，暂不包含
-                indicators_30m.append((col, value))
+                indicators_15m.append((col, value))
 
         context_parts.append("")
         context_parts.append("<indicators>")
@@ -1112,9 +1112,9 @@ class ContextBuilder:
             for ind, val in indicators_1h:
                 context_parts.append(f"  {ind}: {val:.4f}")
 
-        if indicators_30m:
-            context_parts.append("### 30分钟指标")
-            for ind, val in indicators_30m:
+        if indicators_15m:
+            context_parts.append("### 15分钟指标")
+            for ind, val in indicators_15m:
                 context_parts.append(f"  {ind}: {val:.4f}")
 
         context_parts.append("</indicators>")

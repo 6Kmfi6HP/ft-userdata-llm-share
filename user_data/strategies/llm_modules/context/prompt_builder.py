@@ -37,8 +37,8 @@ class StrategyConfig:
     # 置信度 > 90: 100% 仓位
 
     # 持仓时间相关 (分钟)
-    MIN_HOLD_MINUTES: int = 90      # 最小持仓时间 (3根30分钟K线)
-    MIN_HOLD_KLINES: int = 3        # 对应的K线数量
+    MIN_HOLD_MINUTES: int = 120     # 最小持仓时间 (8根15分钟K线)
+    MIN_HOLD_KLINES: int = 8        # 对应的K线数量
 
     # 仓位调整阈值
     ADD_POSITION_MIN_PROFIT: float = 3.0   # 加仓最低盈利 (%)

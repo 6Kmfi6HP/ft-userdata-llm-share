@@ -54,6 +54,17 @@ class IndicatorCalculator:
         # 基于学术论文: Begušić & Kostanjčar 2019 "Momentum and Liquidity in Cryptocurrencies"
         dataframe['roc_14'] = ta.ROC(dataframe, timeperiod=14)
 
+        # Stochastic 随机指标 - 短期超买超卖判断
+        # 参考 QuantAgent 实现: fastk_period=14, slowk_period=3, slowd_period=3
+        # %K > 80 超买, %K < 20 超卖; %K与%D交叉为信号
+        stoch = ta.STOCH(dataframe, fastk_period=14, slowk_period=3, slowd_period=3)
+        dataframe['stoch_k'] = stoch['slowk']
+        dataframe['stoch_d'] = stoch['slowd']
+
+        # Williams %R - 类似RSI但更敏感的超买超卖指标
+        # 范围 -100 到 0: < -80 超卖, > -20 超买
+        dataframe['willr'] = ta.WILLR(dataframe, timeperiod=14)
+
         return dataframe
 
     @staticmethod
@@ -127,7 +138,16 @@ class IndicatorCalculator:
         Returns:
             添加了趋势强度指标的DataFrame
         """
+        # ADX - 趋势强度 (不含方向)
+        # > 25 强趋势, 20-25 中等, < 20 弱趋势/震荡
         dataframe['adx'] = ta.ADX(dataframe, timeperiod=14)
+
+        # +DI/-DI - 方向性指标 (Directional Indicators)
+        # +DI > -DI = 上升趋势主导 (看多信号)
+        # -DI > +DI = 下降趋势主导 (看空信号)
+        # +DI 与 -DI 交叉 = 趋势反转信号
+        dataframe['plus_di'] = ta.PLUS_DI(dataframe, timeperiod=14)
+        dataframe['minus_di'] = ta.MINUS_DI(dataframe, timeperiod=14)
 
         return dataframe
 
