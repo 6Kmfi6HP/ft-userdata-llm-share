@@ -73,6 +73,17 @@ ContextBuilder → Builds market context + technical indicators
     ↓
 PromptBuilder → Generates system prompts (entry/position management)
     ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ Multi-Agent Pre-Analysis (Optional, configurable)              │
+│   ├─ IndicatorAgent → RSI, MACD, ADX analysis                  │
+│   ├─ TrendAgent → EMA structure, support/resistance            │
+│   └─ SentimentAgent → Funding rate, OI, Fear & Greed           │
+│   ↓                                                            │
+│ AgentOrchestrator → Weighted consensus aggregation             │
+└─────────────────────────────────────────────────────────────────┘
+    ↓
+ConsensusClient → Dual-role verification (Opportunity Finder + Risk Assessor)
+    ↓
 LLMClient → Calls LLM API with function definitions
     ↓
 Function Calling Loop (max 5 iterations):
@@ -102,7 +113,64 @@ Execute on Binance Futures
 
 **`llm_modules/utils/`** - Key modules: `context_builder.py` (market context), `stoploss_calculator.py` (dynamic stop-loss), `decision_checker.py` (risk validation), `position_tracker.py` (MFE/MAE tracking)
 
-**`llm_modules/indicators/indicator_calculator.py`** - Technical indicators: EMA, RSI, MACD, ATR, ADX, MFI, OBV
+**`llm_modules/indicators/indicator_calculator.py`** - Technical indicators: EMA, RSI, MACD, Stochastic (%K/%D), Williams %R, ATR, ADX (+DI/-DI), MFI, OBV, ROC, Amihud
+
+**`llm_modules/agents/`** - Multi-agent pre-analysis system (see below)
+
+### Multi-Agent Pre-Analysis System
+
+Optional system providing specialized market analysis before main LLM decision. Inspired by QuantAgent's multi-agent architecture.
+
+**Architecture**:
+```
+AgentOrchestrator
+    ├─ IndicatorAgent (weight: 1.0)
+    │   └─ RSI, MACD, ADX (+DI/-DI), Stochastic (%K/%D), Williams %R, MFI analysis
+    ├─ TrendAgent (weight: 1.2)
+    │   └─ EMA structure, price structure, support/resistance
+    └─ SentimentAgent (weight: 0.8)
+        └─ Funding rate, long/short ratio, OI, Fear & Greed
+            ↓
+    Weighted Consensus Aggregation → Injected into ConsensusClient
+```
+
+**Module Files**:
+- `agents/agent_state.py`: State management (`AgentState`, `AgentReport`, `Signal`, `Direction`)
+- `agents/base_agent.py`: Abstract base class with standardized prompt/response handling
+- `agents/indicator_agent.py`: Technical indicator analysis specialist
+- `agents/trend_agent.py`: Trend structure and price level analysis
+- `agents/sentiment_agent.py`: Market sentiment and positioning analysis
+- `agents/orchestrator.py`: Coordinates agents, aggregates results via weighted voting
+
+**Consensus Calculation**:
+- Direction votes weighted by agent confidence × agent weight
+- Default weights: Trend (1.2) > Indicator (1.0) > Sentiment (0.8)
+- Confidence = average of agreeing agents' confidence levels
+- Key levels aggregated from all agent reports
+
+**Agent Report Format** (standardized output):
+```
+[信号列表]
+- signal_type: description (strength: strong/medium/weak)
+
+[方向判断]
+long / short / neutral
+
+[置信度]
+0-100
+
+[关键价位]
+支撑: price
+阻力: price
+
+[分析摘要]
+Brief analysis summary
+```
+
+**Integration with ConsensusClient**:
+- Agents run before dual-role verification
+- Analysis injected as system context for both roles
+- Disabled by default (`multi_agent_enabled: false`)
 
 ### Four-Layer Stop Loss & Take Profit System
 
@@ -235,6 +303,27 @@ Based on Google Prompt Engineering Whitepaper, the system enforces structured Ch
 **Custom Exit Config** (`custom_exit_config`):
 - Defines Layer 4 extreme take-profit triggers (ROI thresholds, RSI conditions)
 
+**Multi-Agent Config** (within `consensus_config`):
+```json
+"consensus_config": {
+    "enabled": true,
+    "multi_agent_enabled": true,
+    "agent_config": {
+        "parallel_execution": true,
+        "agent_weights": {
+            "IndicatorAgent": 1.0,
+            "TrendAgent": 1.2,
+            "SentimentAgent": 0.8
+        },
+        "enabled_agents": ["indicator", "trend", "sentiment"]
+    }
+}
+```
+- `multi_agent_enabled`: Toggle multi-agent pre-analysis (default: false)
+- `parallel_execution`: Run agents concurrently (default: true)
+- `agent_weights`: Relative importance for consensus calculation
+- `enabled_agents`: Which agents to activate (all three by default)
+
 ## Working with This Codebase
 
 ### When Modifying Trading Logic
@@ -296,6 +385,36 @@ tail -5 user_data/logs/trade_experience.jsonl | jq '{pair, profit_pct, side}'
 3. **Self-Reflection**: `llm_modules/learning/self_reflection.py`
    - Customize reflection prompts for different insights
    - Adjust trade evaluation criteria
+
+### When Working with Multi-Agent System
+
+1. **Adding a New Agent**:
+   - Create new file in `llm_modules/agents/` inheriting from `BaseAgent`
+   - Implement `_get_analysis_focus()` to return agent-specific analysis prompt
+   - Register in `orchestrator.py` (`_create_default_agents()` method)
+   - Add to `__init__.py` exports
+   - Update config schema in `consensus_client.py`
+
+2. **Modifying Agent Prompts**:
+   - Each agent has `ROLE_PROMPT` class variable defining expertise
+   - `_get_analysis_focus()` returns task-specific analysis instructions
+   - Output format is standardized in `base_agent.py` (`_build_analysis_prompt()`)
+
+3. **Adjusting Consensus Weights**:
+   - Edit `agent_weights` in config.json under `consensus_config.agent_config`
+   - Higher weight = more influence on final direction
+   - Default: Trend (1.2) > Indicator (1.0) > Sentiment (0.8)
+
+4. **Debugging Agent Analysis**:
+   - Use `consensus_client.get_last_agent_state()` for last analysis state
+   - Check individual agent reports in returned state
+   - Enable debug logging: `logging.getLogger('llm_modules.agents').setLevel(logging.DEBUG)`
+   - Agent analysis is logged when enabled
+
+5. **Performance Optimization**:
+   - Set `parallel_execution: true` for concurrent agent calls (default)
+   - Disable unused agents via `enabled_agents` config
+   - Reduce agent prompt complexity if timeout issues occur
 
 ### Critical Implementation Patterns
 
