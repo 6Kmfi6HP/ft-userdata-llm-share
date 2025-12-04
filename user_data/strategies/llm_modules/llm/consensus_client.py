@@ -1,16 +1,39 @@
 """
-双重决策共识客户端模块
-对同一模型使用相似提示词进行两次决策，通过对比结果提高决策可靠性
+QuantAgent 风格多 Agent 决策系统
 
-设计原则：
-1. 使用相同模型进行两次独立决策
-2. 第二次请求添加验证性提示词变体
-3. 对比两次决策结果，采用共识或保守策略
-4. 置信度取平均值，reason合并两次结果
+架构设计（类似 QuantAgent）：
+┌─────────────────────────────────────────────────────────────────┐
+│                    Stage 1: 专业 Agent 并行分析                  │
+├─────────────────────────────────────────────────────────────────┤
+│  IndicatorAgent → RSI, MACD, ADX, Stochastic 分析               │
+│  TrendAgent → EMA 结构、支撑阻力、价格结构分析                    │
+│  SentimentAgent → 资金费率、多空比、OI、恐惧贪婪分析              │
+│           ↓                                                     │
+│  AgentOrchestrator → 加权共识聚合                                │
+└─────────────────────────────────────────────────────────────────┘
+                               ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                    Stage 2: 双 Decision Agent 并行决策           │
+├─────────────────────────────────────────────────────────────────┤
+│  Decision Agent 1 (激进): 积极寻找交易机会                       │
+│  Decision Agent 2 (保守): 严格风险评估                           │
+│           ↓                                                     │
+│  输入：三份完整的专业分析报告（QuantAgent 风格）                  │
+│  输出：交易函数调用                                              │
+│           ↓                                                     │
+│  共识解决：置信度优先 / 保守策略                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+核心改进（v3 - QuantAgent 风格）：
+1. 三份完整的专业 Agent 报告（类似 QuantAgent 的 indicator_report, pattern_report, trend_report）
+2. 双 Decision Agent 并行决策（替代原 OpportunityFinder + RiskAssessor）
+3. 决策提示词采用 QuantAgent 的决策策略风格
+4. 支持三报告一致性优先的共识机制
 """
 import logging
 import json
 import copy
+import re
 from typing import Dict, Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -27,33 +50,92 @@ class ConsensusClient:
     包装LLMClient，提供双重决策验证功能
     """
 
-    # ========== 双角色并行验证模式 ==========
-    # 机会发现者角色前缀：积极识别高胜率交易机会
-    OPPORTUNITY_FINDER_PREFIX = """# 决策角色：机会发现者 Opportunity Finder
-你的主要职责是识别高胜率的交易机会。
+    # ========== QuantAgent 风格 Decision Agent 模式 ==========
+    # Decision Agent 1: 激进决策者 - 积极寻找交易机会
+    DECISION_AGENT_AGGRESSIVE_PREFIX = """# 决策角色：激进决策者 (Aggressive Decision Maker)
 
-在满足以下条件时积极建议入场：
-- 至少2个独立信号确认
-- 盈亏比 ≥ 2:1
-- 趋势方向明确或反转信号充分
+你是一位高频交易分析师，基于以下三份专业分析报告做出交易决策。
+
+### 决策策略：
+1. 只对**已确认**的信号采取行动 — 避免投机性信号
+2. 优先考虑**三份报告方向一致**的情况
+3. 给予以下信号更高权重：
+   - 近期强动量信号（如 MACD 交叉、RSI 突破）
+   - 明确的价格行为（如突破 K 线、拒绝影线）
+   - 趋势线支撑/阻力位的确认
+4. 如果报告存在分歧：
+   - 选择有**更强、更近期确认**的方向
+   - 优先选择**有动量支撑**的信号
+5. 建议盈亏比在 **1.5 到 2.5** 之间
+
+### 你的倾向：
+- 积极寻找交易机会
+- 在信号足够强时果断入场
+- 相信动量和趋势的延续性
 
 ---
 
 """
 
-    # 风险评估者角色前缀：识别潜在风险和交易陷阱
-    RISK_ASSESSOR_PREFIX = """# 决策角色：风险评估者 Risk Assessor
-你的主要职责是识别交易风险和潜在陷阱。
+    # Decision Agent 2: 保守决策者 - 严格风险评估
+    DECISION_AGENT_CONSERVATIVE_PREFIX = """# 决策角色：保守决策者 (Conservative Decision Maker)
 
-只在以下情况下才同意入场：
-- 风险充分可控
-- 盈亏比显著有利
-- 无明显的陷阱迹象
+你是一位高频交易分析师，基于以下三份专业分析报告做出交易决策。
 
-如有重大风险疑虑，宁可错过机会也要保守观望。
+### 决策策略：
+1. 只对**已确认**的信号采取行动 — 避免投机性信号
+2. 优先考虑**三份报告方向一致**的情况
+3. 给予以下信号更高权重：
+   - 近期强动量信号（如 MACD 交叉、RSI 突破）
+   - 明确的价格行为（如突破 K 线、拒绝影线）
+   - 趋势线支撑/阻力位的确认
+4. 如果报告存在分歧：
+   - 选择**更防御性**的方向
+   - 不确定时倾向于**观望**
+5. 建议盈亏比在 **1.5 到 2.5** 之间
+
+### 你的倾向：
+- 严格评估风险和陷阱
+- 只在信号非常明确时入场
+- 宁可错过机会也不冒险
 
 ---
 
+"""
+
+    # Agent 报告注入模板（支持四个Agent，包括视觉分析）
+    AGENT_REPORTS_TEMPLATE = """
+## 专业分析报告
+
+以下是四位专业分析师对当前市场的独立分析：
+
+---
+### 技术指标分析报告 (Technical Indicator Report)
+{indicator_report}
+
+---
+### 趋势结构分析报告 (Trend Analysis Report)
+{trend_report}
+
+---
+### 市场情绪分析报告 (Sentiment Report)
+{sentiment_report}
+
+---
+### K线形态分析报告 (Pattern Recognition Report - 视觉分析)
+{pattern_report}
+
+---
+### 预分析共识
+- **共识方向**: {consensus_direction}
+- **共识置信度**: {consensus_confidence:.1f}%
+- **关键支撑位**: {key_support}
+- **关键阻力位**: {key_resistance}
+
+---
+
+请基于以上四份报告的综合分析，结合市场数据做出最终交易决策。
+注意：K线形态分析报告来自视觉分析Agent，可识别头肩顶/底、双顶/底、三角形等经典形态。
 """
 
     # 保守决策优先级（数字越小越保守）
@@ -97,8 +179,59 @@ class ConsensusClient:
         self.require_consensus = config.get("require_consensus", False)
         self.confidence_threshold = config.get("confidence_threshold", 80)
 
-        logger.info(f"双重决策共识客户端已初始化（双角色模式）: enabled={self.enabled}, "
-                   f"parallel={self.parallel_requests}, strategy={self.conflict_strategy}")
+        # ===== 多 Agent 预分析系统配置 =====
+        self.multi_agent_enabled = config.get("multi_agent_enabled", False)
+        self.agent_orchestrator = None
+        self._last_agent_state = None  # 缓存最近一次的 Agent 分析状态
+
+        # ===== OHLCV 数据缓存（用于视觉分析 Agent）=====
+        self._current_ohlcv = None  # 当前 K 线数据 (DataFrame)
+        self._current_timeframe = None  # 当前时间框架 (如 "30m")
+        self._current_pair = None  # 当前交易对
+
+        if self.multi_agent_enabled:
+            try:
+                from ..agents.orchestrator import AgentOrchestrator
+                agent_config = config.get("agent_config", {})
+                self.agent_orchestrator = AgentOrchestrator(
+                    self.llm_client,
+                    config=agent_config
+                )
+                logger.info("✅ 多 Agent 预分析系统已启用")
+            except ImportError as e:
+                logger.warning(f"⚠️ 无法导入 AgentOrchestrator，多 Agent 模式已禁用: {e}")
+                self.multi_agent_enabled = False
+            except Exception as e:
+                logger.error(f"❌ 初始化 AgentOrchestrator 失败: {e}")
+                self.multi_agent_enabled = False
+
+        logger.info(f"QuantAgent 风格决策系统已初始化: enabled={self.enabled}, "
+                   f"parallel={self.parallel_requests}, strategy={self.conflict_strategy}, "
+                   f"multi_agent={self.multi_agent_enabled}")
+
+    def set_current_ohlcv(self, dataframe, timeframe: str, pair: str = None):
+        """
+        设置当前 K 线数据（供视觉分析 Agent 使用）
+
+        在调用 call_with_functions 之前调用此方法，
+        将 OHLCV 数据传递给多 Agent 预分析系统。
+
+        Args:
+            dataframe: pandas DataFrame 包含 OHLCV 数据
+            timeframe: 时间框架字符串（如 "30m", "1h"）
+            pair: 交易对（可选，用于日志记录）
+        """
+        self._current_ohlcv = dataframe
+        self._current_timeframe = timeframe
+        self._current_pair = pair
+        logger.debug(f"已设置 OHLCV 数据: {pair}, timeframe={timeframe}, "
+                    f"rows={len(dataframe) if dataframe is not None else 0}")
+
+    def clear_current_ohlcv(self):
+        """清除当前 OHLCV 数据缓存"""
+        self._current_ohlcv = None
+        self._current_timeframe = None
+        self._current_pair = None
 
     def call_with_functions(
         self,
@@ -133,8 +266,12 @@ class ConsensusClient:
         start_time = datetime.now()
 
         logger.info("=" * 60)
-        logger.info("🔄 双重决策共识验证开始（双角色模式）")
+        logger.info("🔄 QuantAgent 风格多 Agent 决策开始")
         logger.info("=" * 60)
+
+        # ===== 多 Agent 预分析（如果启用）=====
+        if self.multi_agent_enabled and self.agent_orchestrator:
+            messages = self._run_multi_agent_analysis(messages)
 
         # 在共识模式下，跳过置信度门槛检查（后置验证）
         if self.trading_tools:
@@ -163,7 +300,7 @@ class ConsensusClient:
                 self.trading_tools.set_skip_confidence_check(False)
 
         elapsed = (datetime.now() - start_time).total_seconds()
-        logger.info(f"⏱️  双重决策耗时: {elapsed:.2f}秒")
+        logger.info(f"⏱️  QuantAgent 决策耗时: {elapsed:.2f}秒")
         logger.info("=" * 60)
 
         return consensus_result
@@ -227,31 +364,213 @@ class ConsensusClient:
 
         return consensus_result
 
-    def _create_role_messages(
+    # ===== 多 Agent 预分析相关方法 =====
+
+    def _run_multi_agent_analysis(
         self,
-        messages: List[Dict[str, str]],
-        role: str = "opportunity"
+        messages: List[Dict[str, str]]
     ) -> List[Dict[str, str]]:
         """
-        创建带有角色前缀的消息
+        运行多 Agent 预分析并将结果注入消息（QuantAgent 风格）
 
-        通过在 system message 开头注入角色定义，
-        让两次 LLM 调用具有不同的认知框架，实现真正独立的验证。
+        流程：
+        1. 提取市场上下文和交易对
+        2. 并行执行三个专业 Agent 分析
+        3. 生成 QuantAgent 风格的完整报告
+        4. 注入到 Decision Agent 的消息中
 
         Args:
             messages: 原始消息列表
-            role: 'opportunity'（机会发现者）或 'risk'（风险评估者）
+
+        Returns:
+            注入了完整 Agent 分析报告的消息列表
+        """
+        try:
+            # 从消息中提取市场上下文和交易对
+            market_context = self._extract_market_context(messages)
+            pair = self._extract_pair(messages)
+
+            if not market_context:
+                logger.warning("⚠️ 无法提取市场上下文，跳过多 Agent 分析")
+                return messages
+
+            logger.info(f"🤖 开始多 Agent 预分析 (QuantAgent 风格): {pair or 'UNKNOWN'}")
+
+            # 检查是否有 OHLCV 数据可用于视觉分析
+            has_ohlcv = self._current_ohlcv is not None and len(self._current_ohlcv) > 0
+            if has_ohlcv:
+                logger.info(f"   ✅ OHLCV 数据可用: {len(self._current_ohlcv)} 根 K 线, "
+                           f"timeframe={self._current_timeframe}")
+            else:
+                logger.info("   ⚠️ 无 OHLCV 数据，视觉分析将不可用")
+
+            # 运行 Agent 分析（并行执行专业 Agent，包括视觉分析）
+            agent_state = self.agent_orchestrator.run_analysis(
+                market_context=market_context,
+                pair=pair or "UNKNOWN",
+                ohlcv_data=self._current_ohlcv,  # 传递 OHLCV 数据用于图表生成
+                timeframe=self._current_timeframe  # 传递时间框架
+            )
+
+            # 缓存分析状态
+            self._last_agent_state = agent_state
+
+            # 获取 QuantAgent 风格的完整报告（字典格式）
+            agent_reports = self.agent_orchestrator.format_for_decision(agent_state)
+
+            if agent_reports:
+                # 注入完整的三份专业报告到消息
+                messages = self._inject_agent_analysis(messages, agent_reports)
+
+                logger.info("✅ QuantAgent 风格的多 Agent 报告已注入 Decision Agent")
+                logger.info(f"   - 技术指标报告: {len(agent_reports.get('indicator_report', ''))} 字符")
+                logger.info(f"   - 趋势结构报告: {len(agent_reports.get('trend_report', ''))} 字符")
+                logger.info(f"   - 市场情绪报告: {len(agent_reports.get('sentiment_report', ''))} 字符")
+                logger.info(f"   - 预分析共识: {agent_reports.get('consensus_direction')} "
+                           f"({agent_reports.get('consensus_confidence', 0):.1f}%)")
+
+            return messages
+
+        except Exception as e:
+            logger.error(f"❌ 多 Agent 分析失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return messages
+
+    def _extract_market_context(self, messages: List[Dict[str, str]]) -> Optional[str]:
+        """
+        从消息中提取市场上下文
+
+        市场上下文通常在 user 消息中，包含 <market_data> 标签
+        """
+        for msg in messages:
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                # 尝试提取 market_data 标签内容
+                if "<market_data>" in content:
+                    return content
+                # 如果没有标签，但内容较长，可能就是市场上下文
+                if len(content) > 500:
+                    return content
+        return None
+
+    def _extract_pair(self, messages: List[Dict[str, str]]) -> Optional[str]:
+        """
+        从消息中提取交易对
+
+        交易对通常在 "交易对:" 或 "pair:" 后面
+        """
+        for msg in messages:
+            content = msg.get("content", "")
+
+            # 尝试匹配 "交易对: XXX/USDT:USDT" 格式
+            match = re.search(r'交易对[:\s]+([A-Z]+/USDT(?::USDT)?)', content)
+            if match:
+                return match.group(1)
+
+            # 尝试匹配 "pair: XXX/USDT" 格式
+            match = re.search(r'pair[:\s]+([A-Z]+/USDT(?::USDT)?)', content, re.IGNORECASE)
+            if match:
+                return match.group(1)
+
+            # 尝试匹配 "## 交易对: XXX" 格式
+            match = re.search(r'##\s*交易对[:\s]+([A-Z]+/USDT(?::USDT)?)', content)
+            if match:
+                return match.group(1)
+
+        return None
+
+    def _inject_agent_analysis(
+        self,
+        messages: List[Dict[str, str]],
+        agent_analysis: Dict[str, Any]
+    ) -> List[Dict[str, str]]:
+        """
+        将 Agent 分析结果注入到消息中（QuantAgent 风格）
+
+        注入位置：在 system message 末尾添加完整的三份专业报告
+
+        Args:
+            messages: 原始消息列表
+            agent_analysis: Agent 分析数据字典，包含:
+                - indicator_report: 技术指标报告
+                - trend_report: 趋势结构报告
+                - sentiment_report: 市场情绪报告
+                - pattern_report: K线形态报告（视觉分析）
+                - consensus_direction: 预分析共识方向
+                - consensus_confidence: 预分析共识置信度
+                - key_support: 关键支撑位
+                - key_resistance: 关键阻力位
+
+        Returns:
+            注入后的消息列表
+        """
+        messages = copy.deepcopy(messages)
+
+        # 格式化关键价位（保留2位小数）
+        key_support = agent_analysis.get('key_support')
+        key_resistance = agent_analysis.get('key_resistance')
+        key_support_str = f"{key_support:.2f}" if isinstance(key_support, (int, float)) else 'N/A'
+        key_resistance_str = f"{key_resistance:.2f}" if isinstance(key_resistance, (int, float)) else 'N/A'
+
+        # 使用 QuantAgent 风格的报告模板（包括视觉分析报告）
+        injection_text = self.AGENT_REPORTS_TEMPLATE.format(
+            indicator_report=agent_analysis.get('indicator_report', '技术指标分析不可用'),
+            trend_report=agent_analysis.get('trend_report', '趋势结构分析不可用'),
+            sentiment_report=agent_analysis.get('sentiment_report', '市场情绪分析不可用'),
+            pattern_report=agent_analysis.get('pattern_report', 'K线形态分析不可用'),
+            consensus_direction=agent_analysis.get('consensus_direction', 'neutral'),
+            consensus_confidence=agent_analysis.get('consensus_confidence', 0),
+            key_support=key_support_str,
+            key_resistance=key_resistance_str
+        )
+
+        # 在 system message 末尾注入
+        for msg in messages:
+            if msg.get("role") == "system":
+                msg["content"] = msg["content"] + "\n" + injection_text
+                break
+
+        return messages
+
+    def get_last_agent_state(self) -> Optional[Dict[str, Any]]:
+        """
+        获取最近一次的 Agent 分析状态
+
+        用于日志记录和调试
+
+        Returns:
+            AgentState 字典或 None
+        """
+        if self._last_agent_state and self.agent_orchestrator:
+            return self.agent_orchestrator.format_for_logging(self._last_agent_state)
+        return None
+
+    def _create_role_messages(
+        self,
+        messages: List[Dict[str, str]],
+        role: str = "aggressive"
+    ) -> List[Dict[str, str]]:
+        """
+        创建带有 Decision Agent 角色前缀的消息
+
+        通过在 system message 开头注入角色定义，
+        让两次 LLM 调用具有不同的决策倾向，实现双重 Decision Agent 验证。
+
+        Args:
+            messages: 原始消息列表
+            role: 'aggressive'（激进决策者）或 'conservative'（保守决策者）
 
         Returns:
             带有角色前缀的消息列表
         """
         messages_modified = copy.deepcopy(messages)
 
-        # 选择角色前缀
-        if role == "opportunity":
-            prefix = self.OPPORTUNITY_FINDER_PREFIX
+        # 选择 Decision Agent 角色前缀
+        if role == "aggressive":
+            prefix = self.DECISION_AGENT_AGGRESSIVE_PREFIX
         else:
-            prefix = self.RISK_ASSESSOR_PREFIX
+            prefix = self.DECISION_AGENT_CONSERVATIVE_PREFIX
 
         # 在 system message 开头注入角色前缀
         for msg in messages_modified:
@@ -268,32 +587,32 @@ class ConsensusClient:
         max_iterations: int
     ) -> tuple:
         """
-        并行执行两次决策（双角色模式）
+        并行执行两次决策（双 Decision Agent 模式）
 
-        第1次：机会发现者 - 积极识别交易机会
-        第2次：风险评估者 - 识别潜在风险陷阱
+        第1次：激进决策者 - 积极寻找交易机会
+        第2次：保守决策者 - 严格风险评估
         """
-        logger.info("📡 并行执行两次LLM决策（双角色模式）...")
+        logger.info("📡 并行执行两次LLM决策（双 Decision Agent 模式）...")
 
-        # 创建两个角色的消息
-        messages_opportunity = self._create_role_messages(messages, role="opportunity")
-        messages_risk = self._create_role_messages(messages, role="risk")
+        # 创建两个 Decision Agent 的消息
+        messages_aggressive = self._create_role_messages(messages, role="aggressive")
+        messages_conservative = self._create_role_messages(messages, role="conservative")
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             future_1 = executor.submit(
                 self.llm_client.call_with_functions,
-                messages_opportunity, functions, max_iterations
+                messages_aggressive, functions, max_iterations
             )
             future_2 = executor.submit(
                 self.llm_client.call_with_functions,
-                messages_risk, functions, max_iterations
+                messages_conservative, functions, max_iterations
             )
 
             response_1 = future_1.result()
             response_2 = future_2.result()
 
-        logger.info("   ✅ 机会发现者决策完成")
-        logger.info("   ✅ 风险评估者决策完成")
+        logger.info("   ✅ 激进决策者 (Decision Agent 1) 完成")
+        logger.info("   ✅ 保守决策者 (Decision Agent 2) 完成")
 
         return response_1, response_2
 
@@ -304,28 +623,28 @@ class ConsensusClient:
         max_iterations: int
     ) -> tuple:
         """
-        顺序执行两次决策（双角色模式）
+        顺序执行两次决策（双 Decision Agent 模式）
 
-        第1次：机会发现者 - 积极识别交易机会
-        第2次：风险评估者 - 识别潜在风险陷阱
+        第1次：激进决策者 - 积极寻找交易机会
+        第2次：保守决策者 - 严格风险评估
         """
-        logger.info("📡 顺序执行两次LLM决策（双角色模式）...")
+        logger.info("📡 顺序执行两次LLM决策（双 Decision Agent 模式）...")
 
-        # 创建两个角色的消息
-        messages_opportunity = self._create_role_messages(messages, role="opportunity")
-        messages_risk = self._create_role_messages(messages, role="risk")
+        # 创建两个 Decision Agent 的消息
+        messages_aggressive = self._create_role_messages(messages, role="aggressive")
+        messages_conservative = self._create_role_messages(messages, role="conservative")
 
-        logger.info("   第1次决策（机会发现者）...")
+        logger.info("   第1次决策（激进决策者）...")
         response_1 = self.llm_client.call_with_functions(
-            messages_opportunity, functions, max_iterations
+            messages_aggressive, functions, max_iterations
         )
-        logger.info("   ✅ 机会发现者决策完成")
+        logger.info("   ✅ 激进决策者 (Decision Agent 1) 完成")
 
-        logger.info("   第2次决策（风险评估者）...")
+        logger.info("   第2次决策（保守决策者）...")
         response_2 = self.llm_client.call_with_functions(
-            messages_risk, functions, max_iterations
+            messages_conservative, functions, max_iterations
         )
-        logger.info("   ✅ 风险评估者决策完成")
+        logger.info("   ✅ 保守决策者 (Decision Agent 2) 完成")
 
         return response_1, response_2
 
@@ -375,20 +694,20 @@ class ConsensusClient:
         conf_1 = details_1.get("confidence_score", 50)
         conf_2 = details_2.get("confidence_score", 50)
 
-        logger.info(f"📊 双角色决策对比:")
-        logger.info(f"   【机会发现者】: {action_1} (置信度: {conf_1})")
-        logger.info(f"   【风险评估者】: {action_2} (置信度: {conf_2})")
+        logger.info(f"📊 双 Decision Agent 决策对比:")
+        logger.info(f"   【激进决策者】: {action_1} (置信度: {conf_1})")
+        logger.info(f"   【保守决策者】: {action_2} (置信度: {conf_2})")
 
         # 判断是否达成共识
         if action_1 == action_2:
             # 动作一致 - 完全共识
-            logger.info(f"✅ 完全共识: 两个角色都同意 {action_1}")
+            logger.info(f"✅ 完全共识: 双 Decision Agent 都同意 {action_1}")
             return self._merge_responses(
                 response_1, response_2, details_1, details_2, "full_consensus"
             )
         else:
             # 动作不一致 - 需要决策
-            logger.warning(f"⚠️  角色分歧: 机会发现者主张 {action_1}, 风险评估者主张 {action_2}")
+            logger.warning(f"⚠️  Decision Agent 分歧: 激进决策者主张 {action_1}, 保守决策者主张 {action_2}")
             return self._resolve_conflict(
                 response_1, response_2,
                 action_1, action_2,
@@ -561,17 +880,17 @@ class ConsensusClient:
         if self.conflict_strategy == "confidence":
             # 纯置信度策略
             if conf_1 >= conf_2:
-                logger.info(f"   采用【机会发现者】决策（置信度 {conf_1} >= {conf_2}）")
+                logger.info(f"   采用【激进决策者】决策（置信度 {conf_1} >= {conf_2}）")
                 chosen_response = response_1
                 chosen_details = details_1
             else:
-                logger.info(f"   采用【风险评估者】决策（置信度 {conf_2} > {conf_1}）")
+                logger.info(f"   采用【保守决策者】决策（置信度 {conf_2} > {conf_1}）")
                 chosen_response = response_2
                 chosen_details = details_2
 
         elif self.conflict_strategy == "first":
-            # 始终使用机会发现者
-            logger.info("   采用【机会发现者】决策（first策略）")
+            # 始终使用激进决策者
+            logger.info("   采用【激进决策者】决策（first策略）")
             chosen_response = response_1
             chosen_details = details_1
 
@@ -579,21 +898,21 @@ class ConsensusClient:
             # 置信度差异显著时，优先选择高置信度决策
             if conf_diff > self.CONFIDENCE_DIFF_THRESHOLD:
                 if conf_1 > conf_2:
-                    logger.info(f"   采用【机会发现者】决策（置信度差异 {conf_diff} > {self.CONFIDENCE_DIFF_THRESHOLD}，{conf_1} > {conf_2}）")
+                    logger.info(f"   采用【激进决策者】决策（置信度差异 {conf_diff} > {self.CONFIDENCE_DIFF_THRESHOLD}，{conf_1} > {conf_2}）")
                     chosen_response = response_1
                     chosen_details = details_1
                 else:
-                    logger.info(f"   采用【风险评估者】决策（置信度差异 {conf_diff} > {self.CONFIDENCE_DIFF_THRESHOLD}，{conf_2} > {conf_1}）")
+                    logger.info(f"   采用【保守决策者】决策（置信度差异 {conf_diff} > {self.CONFIDENCE_DIFF_THRESHOLD}，{conf_2} > {conf_1}）")
                     chosen_response = response_2
                     chosen_details = details_2
             else:
                 # 置信度相近，选择更保守的决策
                 if priority_1 <= priority_2:
-                    logger.info(f"   采用【机会发现者】决策（置信度相近，{action_1} 更保守）")
+                    logger.info(f"   采用【激进决策者】决策（置信度相近，{action_1} 更保守）")
                     chosen_response = response_1
                     chosen_details = details_1
                 else:
-                    logger.info(f"   采用【风险评估者】决策（置信度相近，{action_2} 更保守）")
+                    logger.info(f"   采用【保守决策者】决策（置信度相近，{action_2} 更保守）")
                     chosen_response = response_2
                     chosen_details = details_2
 
@@ -720,4 +1039,10 @@ class ConsensusClient:
         stats["consensus_enabled"] = self.enabled
         stats["conflict_strategy"] = self.conflict_strategy
         stats["parallel_requests"] = self.parallel_requests
+
+        # 多 Agent 系统统计
+        stats["multi_agent_enabled"] = self.multi_agent_enabled
+        if self.multi_agent_enabled and self.agent_orchestrator:
+            stats["agent_orchestrator"] = self.agent_orchestrator.get_statistics()
+
         return stats

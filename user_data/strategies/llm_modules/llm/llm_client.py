@@ -3,7 +3,9 @@ LLM客户端模块
 负责与LLM API交互，支持函数调用
 """
 import logging
-from typing import Dict, Any, List, Optional
+import time
+import re
+from typing import Dict, Any, List, Optional, Callable
 import requests
 import json
 from datetime import datetime
@@ -32,11 +34,124 @@ class LLMClient:
 
         self.function_executor = function_executor
 
+        # 重试配置
+        self.retry_times = llm_config.get("retry_times", 3)
+
         # 对话历史(用于上下文管理)
         self.conversation_history: List[Dict[str, Any]] = []
         self.max_history_length = 5  # 保留最近N轮对话
 
-        logger.info(f"LLM客户端已初始化: {self.model}")
+        logger.info(f"LLM客户端已初始化: {self.model} (retry_times={self.retry_times})")
+
+    def _parse_retry_after(self, response: requests.Response) -> float:
+        """从429响应中解析重试等待时间"""
+        # 尝试从 Retry-After header 获取
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return float(retry_after)
+            except ValueError:
+                pass
+
+        # 尝试从响应体解析 "Please retry in X.XXXs"
+        try:
+            text = response.text
+            match = re.search(r"retry in (\d+\.?\d*)s", text, re.IGNORECASE)
+            if match:
+                return float(match.group(1)) + 1  # 加1秒缓冲
+        except Exception:
+            pass
+
+        # 默认等待30秒
+        return 30.0
+
+    def _retry_request(
+        self,
+        request_func: Callable[[], requests.Response],
+        method_name: str,
+        max_retries: int = None
+    ) -> Optional[requests.Response]:
+        """
+        带指数退避的API请求重试
+
+        Args:
+            request_func: 执行请求的函数，返回 requests.Response
+            method_name: 方法名（用于日志）
+            max_retries: 最大重试次数，默认使用config中的retry_times
+
+        Returns:
+            成功的响应或None
+        """
+        if max_retries is None:
+            max_retries = self.retry_times
+
+        last_exception = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                response = request_func()
+
+                # 成功响应
+                if response.status_code == 200:
+                    return response
+
+                # 429 速率限制 - 解析重试时间
+                if response.status_code == 429:
+                    retry_after = self._parse_retry_after(response)
+                    if attempt < max_retries:
+                        logger.warning(
+                            f"[{method_name}] 429 速率限制，等待 {retry_after:.1f}秒后重试 "
+                            f"(尝试 {attempt + 1}/{max_retries + 1})"
+                        )
+                        time.sleep(retry_after)
+                        continue
+                    else:
+                        logger.error(f"[{method_name}] 429 速率限制，重试 {max_retries + 1} 次后仍然失败")
+                        return None
+
+                # 5xx 服务器错误 - 指数退避重试
+                if response.status_code >= 500:
+                    if attempt < max_retries:
+                        wait_time = min(2 ** attempt, 60)  # 1, 2, 4, 8... 最大60秒
+                        logger.warning(
+                            f"[{method_name}] 服务器错误 {response.status_code}，"
+                            f"等待 {wait_time}秒后重试 (尝试 {attempt + 1}/{max_retries + 1})"
+                        )
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(f"[{method_name}] 服务器错误 {response.status_code}，重试 {max_retries + 1} 次后仍然失败")
+                        return None
+
+                # 其他错误（4xx等）不重试，直接返回响应让调用者处理
+                return response
+
+            except requests.Timeout as e:
+                last_exception = e
+                if attempt < max_retries:
+                    wait_time = min(2 ** attempt, 30)
+                    logger.warning(
+                        f"[{method_name}] 请求超时，等待 {wait_time}秒后重试 "
+                        f"(尝试 {attempt + 1}/{max_retries + 1})"
+                    )
+                    time.sleep(wait_time)
+                    continue
+
+            except requests.RequestException as e:
+                last_exception = e
+                if attempt < max_retries:
+                    wait_time = min(2 ** attempt, 30)
+                    logger.warning(
+                        f"[{method_name}] 请求异常: {e}，等待 {wait_time}秒后重试 "
+                        f"(尝试 {attempt + 1}/{max_retries + 1})"
+                    )
+                    time.sleep(wait_time)
+                    continue
+
+        # 所有重试失败
+        if last_exception:
+            logger.error(f"[{method_name}] 重试 {max_retries + 1} 次后仍然失败: {last_exception}")
+        return None
 
     def call_with_functions(
         self,
@@ -312,12 +427,18 @@ class LLMClient:
 
             logger.debug(f"调用LLM API: {self.model}")
 
-            response = requests.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=self.timeout
-            )
+            # 使用重试包装器发送请求
+            def make_request():
+                return requests.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    timeout=self.timeout
+                )
+
+            response = self._retry_request(make_request, "_call_api")
+            if response is None:
+                return None
 
             if response.status_code != 200:
                 logger.error(f"API返回错误: {response.status_code} - {response.text}")
@@ -462,12 +583,18 @@ class LLMClient:
             if max_tokens_value is not None:
                 payload["max_tokens"] = max_tokens_value
 
-            response = requests.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=timeout_value
-            )
+            # 使用重试包装器发送请求
+            def make_request():
+                return requests.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    timeout=timeout_value
+                )
+
+            response = self._retry_request(make_request, "simple_call")
+            if response is None:
+                return None
 
             if response.status_code != 200:
                 logger.error(f"API返回错误: {response.status_code}")
@@ -480,6 +607,176 @@ class LLMClient:
 
         except Exception as e:
             logger.error(f"简单调用失败: {e}")
+            return None
+
+    def vision_call(
+        self,
+        text_prompt: str,
+        image_base64: str,
+        system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
+        image_mime_type: str = "image/png"
+    ) -> Optional[str]:
+        """
+        视觉分析调用 - 支持图片输入的LLM调用
+
+        参考QuantAgent的视觉分析模式，支持K线图、趋势线图等图像分析
+
+        Args:
+            text_prompt: 文本提示词（分析任务描述）
+            image_base64: 图片的base64编码字符串（不含data:前缀）
+            system_prompt: 系统提示词（可选）
+            temperature: 温度参数（可选）
+            max_tokens: 最大token数（可选）
+            timeout: 超时时间（可选）
+            image_mime_type: 图片MIME类型，默认 "image/png"
+
+        Returns:
+            LLM响应文本，失败返回None
+
+        Example:
+            response = llm_client.vision_call(
+                text_prompt="分析这张K线图中的形态",
+                image_base64="iVBORw0KGgoAAAANS...",
+                system_prompt="你是专业的K线形态分析师"
+            )
+        """
+        try:
+            url = f"{self.api_base}/v1/chat/completions"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"
+            }
+
+            # 构建多模态消息内容
+            user_content = [
+                {
+                    "type": "text",
+                    "text": text_prompt
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{image_mime_type};base64,{image_base64}"
+                    }
+                }
+            ]
+
+            # 构建消息列表
+            messages = []
+            if system_prompt:
+                messages.append({
+                    "role": "system",
+                    "content": system_prompt
+                })
+            messages.append({
+                "role": "user",
+                "content": user_content
+            })
+
+            # 构建payload
+            payload = {
+                "model": self.model,
+                "messages": messages
+            }
+
+            # Gemini 模型特殊配置: 视觉分析使用 thinking_budget=-1
+            # 注意: thinking_budget 设为正数会与视觉输入冲突导致空响应
+            # if self.model.startswith("gemini-"):
+            #     payload["extra_body"] = {
+            #         "google": {
+            #             "thinking_config": {
+            #                 "thinking_budget": -1,  # 视觉分析禁用思考预算限制
+            #                 "include_thoughts": True
+            #             }
+            #         }
+            #     }
+
+            # 参数设置
+            temp_value = temperature if temperature is not None else self.temperature
+            max_tokens_value = max_tokens if max_tokens is not None else self.max_tokens
+            timeout_value = timeout if timeout is not None else self.timeout
+
+            if temp_value is not None:
+                payload["temperature"] = temp_value
+            if max_tokens_value is not None:
+                payload["max_tokens"] = max_tokens_value
+
+            logger.debug(f"📸 视觉分析请求: 模型={self.model}, 图片大小={len(image_base64)} bytes")
+
+            # 使用重试包装器发送请求
+            def make_request():
+                return requests.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    timeout=timeout_value
+                )
+
+            response = self._retry_request(make_request, "vision_call")
+            if response is None:
+                return None
+
+            if response.status_code != 200:
+                logger.error(f"视觉API返回错误: {response.status_code} - {response.text}")
+                return None
+
+            data = response.json()
+
+            logger.debug(f"[视觉API响应] {json.dumps(data, ensure_ascii=False)[:500]}")
+
+            # 获取 choices
+            choices = data.get("choices", [])
+            if not choices:
+                logger.warning(f"[视觉API] 响应中没有 choices: {list(data.keys())}")
+                return None
+
+            message = choices[0].get("message", {})
+            if not message:
+                logger.warning(f"[视觉API] choice 中没有 message: {choices[0]}")
+                return None
+
+            # 提取响应内容（兼容多种格式）
+            content = message.get("content", "")
+
+            # 某些模型可能将 content 作为数组返回
+            if not content and isinstance(message.get("content"), list):
+                for item in message.get("content", []):
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        content = item.get("text", "")
+                        break
+                    elif isinstance(item, str):
+                        content = item
+                        break
+
+            # 某些模型可能使用 text 字段
+            if not content:
+                content = message.get("text", "")
+
+            # 记录思考过程（如果有）
+            think = message.get("think", "")
+            reasoning = message.get("reasoning_content", "")
+            if think:
+                logger.debug(f"[视觉分析思考过程]\n{think[:500]}...")
+            if reasoning:
+                logger.debug(f"[视觉分析推理过程]\n{reasoning[:500]}...")
+
+            logger.info("=" * 60)
+            logger.info("📸 视觉分析响应")
+            logger.info("=" * 60)
+            logger.info(f"响应长度: {len(content)} 字符")
+            logger.info(f"响应内容: {content[:300]}...")
+            logger.info("=" * 60)
+
+            return content
+
+        except requests.Timeout:
+            logger.error("视觉分析API请求超时")
+            return None
+        except Exception as e:
+            logger.error(f"视觉分析调用失败: {e}")
             return None
 
     def manage_context_window(
