@@ -778,6 +778,128 @@ class ChartGenerator:
         """获取支持识别的形态列表"""
         return self.PATTERN_TEMPLATES.copy()
 
+    def generate_multi_timeframe_charts(
+        self,
+        ohlcv_primary: pd.DataFrame,
+        ohlcv_htf: pd.DataFrame,
+        pair: str = "",
+        timeframe_primary: str = "15m",
+        timeframe_htf: str = "1h",
+        chart_type: str = "candlestick",
+        num_candles_primary: int = 50,
+        num_candles_htf: int = 50
+    ) -> Dict[str, Any]:
+        """
+        生成多时间周期图表（同时返回两个时间周期的图表）
+
+        用于 Vision 分析时同时提供短期和长期视角
+
+        Args:
+            ohlcv_primary: 主时间周期 OHLCV 数据 (e.g., 15m)
+            ohlcv_htf: 更高时间周期 OHLCV 数据 (e.g., 1h)
+            pair: 交易对名称
+            timeframe_primary: 主时间周期 (e.g., "15m")
+            timeframe_htf: 更高时间周期 (e.g., "1h")
+            chart_type: 图表类型 ("candlestick" 或 "trend")
+            num_candles_primary: 主时间周期 K 线数量
+            num_candles_htf: 更高时间周期 K 线数量
+
+        Returns:
+            {
+                "success": bool,
+                "primary_chart": {
+                    "image_base64": str,
+                    "timeframe": str,
+                    "num_candles": int,
+                    "coverage_hours": float,
+                    ...
+                },
+                "htf_chart": {
+                    "image_base64": str,
+                    "timeframe": str,
+                    "num_candles": int,
+                    "coverage_hours": float,
+                    ...
+                },
+                "error": str (可选)
+            }
+        """
+        result = {
+            "success": False,
+            "primary_chart": None,
+            "htf_chart": None,
+            "error": None
+        }
+
+        # 计算时间覆盖范围
+        def calc_coverage_hours(timeframe: str, num_candles: int) -> float:
+            tf_minutes = {
+                "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+                "1h": 60, "2h": 120, "4h": 240, "6h": 360,
+                "8h": 480, "12h": 720, "1d": 1440
+            }
+            minutes = tf_minutes.get(timeframe, 15)
+            return (minutes * num_candles) / 60
+
+        try:
+            # 生成主时间周期图表
+            if chart_type == "trend":
+                primary_result = self.generate_trend_image(
+                    ohlcv_primary, pair=pair, timeframe=timeframe_primary,
+                    num_candles=num_candles_primary, use_gradient_descent=True
+                )
+            else:
+                primary_result = self.generate_kline_image(
+                    ohlcv_primary, pair=pair, timeframe=timeframe_primary,
+                    num_candles=num_candles_primary
+                )
+
+            if primary_result.get("success"):
+                primary_result["timeframe"] = timeframe_primary
+                primary_result["coverage_hours"] = calc_coverage_hours(
+                    timeframe_primary, primary_result.get("num_candles", num_candles_primary)
+                )
+                result["primary_chart"] = primary_result
+
+            # 生成更高时间周期图表
+            if ohlcv_htf is not None and not ohlcv_htf.empty:
+                if chart_type == "trend":
+                    htf_result = self.generate_trend_image(
+                        ohlcv_htf, pair=pair, timeframe=timeframe_htf,
+                        num_candles=num_candles_htf, use_gradient_descent=True
+                    )
+                else:
+                    htf_result = self.generate_kline_image(
+                        ohlcv_htf, pair=pair, timeframe=timeframe_htf,
+                        num_candles=num_candles_htf
+                    )
+
+                if htf_result.get("success"):
+                    htf_result["timeframe"] = timeframe_htf
+                    htf_result["coverage_hours"] = calc_coverage_hours(
+                        timeframe_htf, htf_result.get("num_candles", num_candles_htf)
+                    )
+                    result["htf_chart"] = htf_result
+
+            # 判断整体成功
+            result["success"] = result["primary_chart"] is not None
+
+            if not result["success"]:
+                result["error"] = "Failed to generate primary timeframe chart"
+
+            logger.info(
+                f"Multi-timeframe charts generated: "
+                f"primary={timeframe_primary}({num_candles_primary} candles), "
+                f"htf={timeframe_htf}({num_candles_htf} candles)"
+            )
+
+            return result
+
+        except Exception as e:
+            logger.error(f"生成多时间周期图表失败: {e}")
+            result["error"] = str(e)
+            return result
+
     @staticmethod
     def is_available() -> bool:
         """检查图表生成功能是否可用"""

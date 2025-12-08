@@ -23,9 +23,7 @@ from llm_modules.experience.experience_manager import ExperienceManager
 from llm_modules.experience.trade_logger import TradeLogger
 
 from llm_modules.indicators.indicator_calculator import IndicatorCalculator
-from llm_modules.llm.function_executor import FunctionExecutor
-from llm_modules.llm.llm_client import LLMClient
-from llm_modules.llm.consensus_client import ConsensusClient
+from llm_modules.llm.langgraph_client import LangGraphClient
 from llm_modules.tools.trading_tools import TradingTools
 
 from llm_modules.utils.config_loader import ConfigLoader
@@ -91,6 +89,22 @@ class LLMFunctionStrategy(IStrategy):
     # 最小持仓时间硬约束
     MIN_HOLDING_MINUTES = 120  # 最小持仓 120 分钟（8 根 15分钟 K 线）
     MIN_HOLDING_EXCEPTION_LOSS_PCT = -0.08  # 仅 -8% 以上亏损可提前退出
+
+    def informative_pairs(self):
+        """
+        告诉 Freqtrade 下载额外的时间框架数据。
+        这些数据用于 multi_timeframe_history 分析。
+        """
+        pairs = self.dp.current_whitelist() if self.dp else []
+        informative_pairs = []
+
+        # 添加多时间框架数据 (与 config.json 中 multi_timeframe_history 配置一致)
+        additional_timeframes = ["30m", "1h", "4h"]
+        for pair in pairs:
+            for tf in additional_timeframes:
+                informative_pairs.append((pair, tf))
+
+        return informative_pairs
 
     def __init__(self, config: dict) -> None:
         """初始化策略"""
@@ -167,24 +181,18 @@ class LLMFunctionStrategy(IStrategy):
                 decision_query_engine=self.decision_query,
             )
 
-            # 4. 初始化函数执行器
-            self.function_executor = FunctionExecutor()
-
-            # 5. 初始化交易工具（简化版 - 只保留交易控制工具）
+            # 4. 初始化交易工具
             self.trading_tools = TradingTools(self)
 
-            # 6. 初始化LLM客户端（支持共识模式）
+            # 5. 初始化 LangGraph 客户端
             consensus_config = self.llm_config.get("consensus_config", {})
-            if consensus_config.get("enabled", False):
-                self.llm_client = ConsensusClient(
-                    self.llm_config,
-                    self.function_executor,
-                    consensus_config,
-                    trading_tools=self.trading_tools  # 传入交易工具用于后置置信度验证
-                )
-                logger.info("✓ 双重决策共识客户端已启用（后置置信度验证）")
-            else:
-                self.llm_client = LLMClient(self.llm_config, self.function_executor)
+            self.llm_client = LangGraphClient(
+                self.llm_config,
+                consensus_config=consensus_config,
+                trading_tools=self.trading_tools,
+                experience_config=self.experience_config
+            )
+            logger.info("✓ LangGraph Bull vs Bear 辩论系统已启用")
 
             # 8. 注册所有工具函数
             self._register_all_tools()
@@ -243,7 +251,7 @@ class LLMFunctionStrategy(IStrategy):
             logger.info("✓ 策略初始化完成")
             logger.info(f"  - LLM模型: {self.llm_config.get('model')}")
             logger.info(
-                f"  - 交易工具已注册: {len(self.function_executor.list_functions())} 个"
+                f"  - 交易工具已就绪: {len(self.trading_tools.get_tools_schema())} 个"
             )
             logger.info(f"  - 自我学习系统: 已启用（历史查询+模式分析+自我反思）")
             logger.info("=" * 60)
@@ -319,14 +327,12 @@ class LLMFunctionStrategy(IStrategy):
             self._last_llm_exit_call[pair] = now
 
     def _register_all_tools(self):
-        """注册所有工具函数（简化版 - 只注册交易控制工具）"""
-        # 只注册交易工具（市场数据、账户信息已在context中提供）
+        """注册所有工具函数（LangGraph 版本 - 工具通过 trading_tools 直接提供）"""
+        # LangGraph 版本不需要注册工具到 function_executor
+        # trading_tools 直接被 LangGraphClient 使用
         if self.trading_tools:
-            self.function_executor.register_tools_from_instance(
-                self.trading_tools, self.trading_tools.get_tools_schema()
-            )
             logger.debug(
-                f"已注册 {len(self.trading_tools.get_tools_schema())} 个交易控制函数"
+                f"Trading tools 已就绪: {len(self.trading_tools.get_tools_schema())} 个交易控制函数"
             )
 
     def _collect_multi_timeframe_history(self, pair: str) -> Dict[str, pd.DataFrame]:
@@ -389,13 +395,48 @@ class LLMFunctionStrategy(IStrategy):
         # 这比之前的逐个判断更简洁，且计算成本可忽略
         IndicatorCalculator.add_all_indicators(dataframe)
 
+    def _get_htf_ohlcv_data(self, pair: str) -> tuple:
+        """
+        获取高时间框架 OHLCV 数据（用于多时间框架 Vision 分析）
+
+        Returns:
+            tuple: (htf_dataframe, htf_timeframe) 或 (None, None) 如果不可用
+        """
+        # 检查是否启用多时间框架 Vision
+        llm_config = self.config.get("llm_config", {})
+        if not llm_config.get("use_vision", False):
+            return None, None
+        if not llm_config.get("multi_timeframe_vision", True):
+            return None, None
+
+        # 检查 DataProvider 是否可用
+        if not hasattr(self, "dp") or not self.dp:
+            logger.debug("DataProvider 不可用，无法获取 HTF 数据")
+            return None, None
+
+        # 默认使用 1h 作为高时间框架
+        htf_timeframe = "1h"
+
+        try:
+            htf_df = self.dp.get_pair_dataframe(pair=pair, timeframe=htf_timeframe)
+            if htf_df is None or htf_df.empty:
+                logger.debug(f"获取 {htf_timeframe} 数据为空")
+                return None, None
+
+            # 返回最近 100 根 K 线（足够 Vision 分析使用）
+            return htf_df.tail(100).copy(), htf_timeframe
+
+        except Exception as e:
+            logger.warning(f"获取 HTF OHLCV 数据失败: {e}")
+            return None, None
+
     def bot_start(self, **kwargs) -> None:
         """
         策略启动时调用（此时dp和wallets已初始化）
         """
         logger.info("✓ Bot已启动，策略运行中...")
         logger.info(
-            f"✓ 交易工具: {len(self.function_executor.list_functions())} 个函数可用"
+            f"✓ 交易工具: {len(self.trading_tools.get_tools_schema())} 个函数可用"
         )
 
         # 启动清算数据追踪器（WebSocket后台收集）
@@ -859,9 +900,13 @@ class LLMFunctionStrategy(IStrategy):
                 {"role": "user", "content": decision_request},
             ]
 
-            # 设置 OHLCV 数据供视觉分析 Agent 使用
+            # 设置 OHLCV 数据供视觉分析 Agent 使用（支持多时间框架）
             if hasattr(self.llm_client, "set_current_ohlcv"):
-                self.llm_client.set_current_ohlcv(dataframe, self.timeframe, pair)
+                htf_df, htf_timeframe = self._get_htf_ohlcv_data(pair)
+                self.llm_client.set_current_ohlcv(
+                    dataframe, self.timeframe, pair,
+                    dataframe_htf=htf_df, timeframe_htf=htf_timeframe
+                )
 
             response = self.llm_client.call_with_functions(
                 messages=messages,
@@ -906,7 +951,7 @@ class LLMFunctionStrategy(IStrategy):
                     trend_strength = signal.get("trend_strength", "未知")
                     stake_amount = signal.get("stake_amount")
 
-                    # 🛡️ 置信度门槛过滤（硬编码 70）
+                    # 置信度门槛过滤
                     MIN_CONFIDENCE_THRESHOLD = 80
                     if action in ["enter_long", "enter_short"]:
                         if confidence_score < MIN_CONFIDENCE_THRESHOLD:
@@ -1082,9 +1127,13 @@ class LLMFunctionStrategy(IStrategy):
                 {"role": "user", "content": decision_request},
             ]
 
-            # 设置 OHLCV 数据供视觉分析 Agent 使用
+            # 设置 OHLCV 数据供视觉分析 Agent 使用（支持多时间框架）
             if hasattr(self.llm_client, "set_current_ohlcv"):
-                self.llm_client.set_current_ohlcv(dataframe, self.timeframe, pair)
+                htf_df, htf_timeframe = self._get_htf_ohlcv_data(pair)
+                self.llm_client.set_current_ohlcv(
+                    dataframe, self.timeframe, pair,
+                    dataframe_htf=htf_df, timeframe_htf=htf_timeframe
+                )
 
             response = self.llm_client.call_with_functions(
                 messages=messages,
@@ -1874,13 +1923,13 @@ class LLMFunctionStrategy(IStrategy):
         )  # 50% 最大距离
 
         if price_distance_pct < MIN_STOP_DISTANCE:
-            logger.warning(
-                f"[第2层-ATR止损] {pair} 止损距离过小: {price_distance_pct * 100:.4f}% < {MIN_STOP_DISTANCE * 100}%，使用硬止损"
+            logger.debug(
+                f"[ATR止损] {pair} 距离过小 {price_distance_pct * 100:.2f}% < {MIN_STOP_DISTANCE * 100:.2f}% | 盈利 {current_profit * 100:+.2f}% → 使用硬止损"
             )
             return None
         elif price_distance_pct > MAX_STOP_DISTANCE:
-            logger.warning(
-                f"[第2层-ATR止损] {pair} 止损距离过大: {price_distance_pct * 100:.2f}% > {MAX_STOP_DISTANCE * 100}%，使用硬止损"
+            logger.debug(
+                f"[ATR止损] {pair} 距离过大 {price_distance_pct * 100:.2f}% > {MAX_STOP_DISTANCE * 100:.0f}% | 盈利 {current_profit * 100:+.2f}% → 使用硬止损"
             )
             return None
 

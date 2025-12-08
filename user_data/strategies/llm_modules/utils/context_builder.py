@@ -590,7 +590,6 @@ class ContextBuilder:
                             position_parts.append(f"    硬止损: {stop_price:.6f} (-{self.hard_stoploss_pct:.1f}%)")
                             position_parts.append(f"      └─ 盈利≤{self.profit_threshold_1*100:.1f}%时使用交易所硬止损")
                     except Exception as e:
-                        # 🔧 修复H6: 异常日志级别从 DEBUG 提升为 WARNING
                         logger.warning(f"[上下文构建] 计算止损位失败: {e}")
 
                     # 添加PositionTracker的追踪数据

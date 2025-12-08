@@ -1,9 +1,9 @@
 """
 LLM Module
-Provides LLM client, consensus client and function executor
+Provides LangGraph client for trading decisions
 """
-from .llm_client import LLMClient
-from .consensus_client import ConsensusClient
-from .function_executor import FunctionExecutor
+from .langgraph_client import LangGraphClient
 
-__all__ = ["LLMClient", "ConsensusClient", "FunctionExecutor"]
+__all__ = [
+    "LangGraphClient",
+]

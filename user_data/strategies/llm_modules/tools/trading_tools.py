@@ -773,23 +773,11 @@ class TradingTools:
         return self._signal_reversal_config.copy()
 
     def clear_signal_for_pair(self, pair: str):
-        """
-        清除指定交易对的信号缓存（线程安全）
-
-        🔧 修复C4: 使用按交易对清除，避免多交易对环境下的竞态条件
-
-        Args:
-            pair: 交易对名称（如 "BTC/USDT:USDT"）
-        """
+        """清除指定交易对的信号缓存"""
         if pair in self._signal_cache:
             del self._signal_cache[pair]
             logger.debug(f"已清除 {pair} 的信号缓存")
 
     def clear_signals(self):
-        """
-        清空所有信号缓存
-
-        ⚠️ DEPRECATED: 在多交易对环境下可能导致竞态条件
-        请使用 clear_signal_for_pair(pair) 代替
-        """
+        """清空所有信号缓存"""
         self._signal_cache.clear()

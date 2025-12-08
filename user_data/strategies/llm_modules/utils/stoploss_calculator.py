@@ -11,7 +11,7 @@ from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
-# 🔧 修复M6: 浮点数比较容差常量（0.0000001% = 1e-9）
+# 浮点数比较容差
 PROFIT_EPSILON = 1e-9
 
 
@@ -39,7 +39,7 @@ class StoplossCalculator:
         multipliers = cfg.get('atr_multipliers', [])
         min_distances = cfg.get('min_distances', [])
 
-        # 🔧 修复M12: 验证配置数组长度（防止 IndexError）
+        # 验证配置数组长度
         if len(thresholds) < 3 or len(multipliers) < 3 or len(min_distances) < 3:
             logger.error(
                 f"止损配置数组长度不足: "
@@ -49,17 +49,16 @@ class StoplossCalculator:
             # 返回一个安全的默认值（1.5% 默认最小距离）
             return 0.015
         
-        # 🔧 修复H4+M6: 2-6% 区间：1.5×ATR, 最小1.5% (使用 < 排除边界 + Epsilon容差)
-        if current_profit < (thresholds[1] + PROFIT_EPSILON):  # < 6% (不含边界)
+        # 2-6% 区间
+        if current_profit < (thresholds[1] + PROFIT_EPSILON):
             atr_multiplier = multipliers[0]
             min_distance = min_distances[0]
 
         # 6-15% 区间：线性过渡从1.5x到1.0x
         elif current_profit <= (thresholds[2] + PROFIT_EPSILON):
-            # 🔧 修复M10: 防止除零错误（如果配置 thresholds[1] == thresholds[2]）
             denominator = thresholds[2] - thresholds[1]
-            if abs(denominator) < 1e-9:  # 避免除零
-                progress = 1.0  # 视为已到达阈值边界
+            if abs(denominator) < 1e-9:
+                progress = 1.0
             else:
                 progress = (current_profit - thresholds[1]) / denominator
 
@@ -94,7 +93,7 @@ class StoplossCalculator:
         multipliers = cfg.get('atr_multipliers', [])
         min_distances = cfg.get('min_distances', [])
 
-        # 🔧 修复M12: 验证配置数组长度（防止 IndexError）
+        # 验证配置数组长度
         if len(thresholds) < 3 or len(multipliers) < 3 or len(min_distances) < 3:
             logger.error(
                 f"止损配置数组长度不足: "
@@ -187,7 +186,7 @@ class StoplossCalculator:
         if atr_pct > max_atr:
             atr_pct = max_atr
         
-        # 🔧 修复M6: 未盈利或盈利过低：返回None表示使用硬止损（使用Epsilon容差）
+        # 未盈利或盈利过低：返回None表示使用硬止损
         if current_profit <= (cfg['profit_thresholds'][0] + PROFIT_EPSILON):
             return None
         
@@ -201,8 +200,7 @@ class StoplossCalculator:
                 current_profit, atr_pct, cfg
             )
         
-        # 🔧 修复H3: 应用趋势适应和时间衰减（允许叠加）
-        # 趋势因子和时间衰减因子可以同时生效（例如：1.2 × 0.8 = 0.96）
+        # 应用趋势适应和时间衰减
         adjustment_factor = 1.0
 
         if adx > cfg['trend_strength_threshold']:

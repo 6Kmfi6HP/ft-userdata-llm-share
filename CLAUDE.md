@@ -65,7 +65,7 @@ docker exec -it freqtrade-llm bash  # SSH into container
 
 ## Architecture & Code Structure
 
-### Core Trading Flow
+### Core Trading Flow (LangGraph Architecture)
 ```
 Market Data (30m candles)
     ↓
@@ -74,23 +74,27 @@ ContextBuilder → Builds market context + technical indicators
 PromptBuilder → Generates system prompts (entry/position management)
     ↓
 ┌─────────────────────────────────────────────────────────────────┐
-│ Multi-Agent Pre-Analysis (Optional, configurable)              │
-│   ├─ IndicatorAgent → RSI, MACD, ADX analysis                  │
-│   ├─ TrendAgent → EMA structure, support/resistance            │
-│   └─ SentimentAgent → Funding rate, OI, Fear & Greed           │
-│   ↓                                                            │
-│ AgentOrchestrator → Weighted consensus aggregation             │
+│ LangGraphClient (Bull vs Bear Debate System)                    │
+│                                                                 │
+│   Stage 1: Analysis Subgraph (Parallel)                         │
+│   ├─ IndicatorAgent → RSI, MACD, ADX, Stochastic                │
+│   ├─ TrendAgent → EMA structure, support/resistance (vision)    │
+│   ├─ SentimentAgent → Funding rate, OI, Fear & Greed            │
+│   ├─ PatternAgent → K-line pattern recognition (vision)         │
+│   └─ Aggregator → Weighted consensus                            │
+│                         ↓                                       │
+│   Stage 2: Debate Subgraph (Sequential) - Layer 3 Verification  │
+│   ├─ BullAgent → Makes strongest case FOR the trade             │
+│   ├─ BearAgent → Finds every possible flaw                      │
+│   └─ JudgeAgent → Evaluates arguments, renders verdict          │
+│                         ↓                                       │
+│   Stage 3: Grounding Verification - Layer 4 Verification        │
+│   └─ Compares LLM claims against actual market data             │
+│                         ↓                                       │
+│   Stage 4: Execution                                            │
+│   ├─ Validator → Risk management checks                         │
+│   └─ Executor → Prepares trading action                         │
 └─────────────────────────────────────────────────────────────────┘
-    ↓
-ConsensusClient → Dual-role verification (Opportunity Finder + Risk Assessor)
-    ↓
-LLMClient → Calls LLM API with function definitions
-    ↓
-Function Calling Loop (max 5 iterations):
-    ├─ LLM analyzes and calls trading function
-    ├─ FunctionExecutor validates and executes
-    ├─ TradingTools performs action (entry/exit/hold/adjust)
-    └─ Loop continues until LLM finishes
     ↓
 TradeLogger → Writes decision to llm_decisions.jsonl
     ↓
@@ -103,7 +107,22 @@ Execute on Binance Futures
 - Extends Freqtrade's IStrategy with hooks: `populate_indicators()`, `populate_entry_trend()`, `custom_exit()`, `custom_stoploss()`, `leverage_callback()`
 - Implements four-layer stop-loss protection (Layer 2: `custom_stoploss()`, Layer 4: `custom_exit()`)
 
-**`llm_modules/llm/`** - LLM client (`llm_client.py`) and function call executor (`function_executor.py`)
+**`llm_modules/llm/`** - LLM clients and execution:
+- `llm_client.py`: Direct LLM client with function calling
+- `langgraph_client.py`: LangGraph-based Bull vs Bear debate client (primary)
+- `consensus_client.py`: Legacy dual-role consensus (deprecated)
+- `function_executor.py`: Function call executor
+
+**`llm_modules/trading_graph/`** - LangGraph trading decision system (see below)
+
+**`llm_modules/lc_integration/`** - LangChain integration:
+- `llm_factory.py`: Creates LangChain chat models from config
+- `tools/`: LangChain tool schemas (entry, exit, position tools)
+- `adapters/`: Context adapters for LangGraph state
+
+**`llm_modules/prompts/`** - Modular prompt templates:
+- `analysis/`: Agent analysis prompts (indicator, sentiment, pattern, trend)
+- `debate/`: Debate prompts (bull, bear, judge for entry and position)
 
 **`llm_modules/tools/trading_tools.py`** - 6 core trading functions: `signal_entry_long/short`, `signal_exit`, `adjust_position`, `signal_hold`, `signal_wait`
 
@@ -111,66 +130,91 @@ Execute on Binance Futures
 
 **`llm_modules/learning/`** - JSONL-based self-learning: `historical_query.py`, `pattern_analyzer.py`, `self_reflection.py`, `trade_evaluator.py`
 
-**`llm_modules/utils/`** - Key modules: `context_builder.py` (market context), `stoploss_calculator.py` (dynamic stop-loss), `decision_checker.py` (risk validation), `position_tracker.py` (MFE/MAE tracking)
+**`llm_modules/utils/`** - Key modules: `context_builder.py` (market context), `stoploss_calculator.py` (dynamic stop-loss), `decision_checker.py` (risk validation), `position_tracker.py` (MFE/MAE tracking), `chart_generator.py` (K-line charts for vision)
 
 **`llm_modules/indicators/indicator_calculator.py`** - Technical indicators: EMA, RSI, MACD, Stochastic (%K/%D), Williams %R, ATR, ADX (+DI/-DI), MFI, OBV, ROC, Amihud
 
-**`llm_modules/agents/`** - Multi-agent pre-analysis system (see below)
+### LangGraph Trading System (`trading_graph/`)
 
-### Multi-Agent Pre-Analysis System
+LangGraph-based multi-stage trading decision system with 6-layer hallucination prevention. Reference: `.agent/LLM_TRADING_HALLUCINATION_SOLUTION_REPORT.md`
 
-Optional system providing specialized market analysis before main LLM decision. Inspired by QuantAgent's multi-agent architecture.
+**6-Layer Hallucination Prevention Architecture**:
 
-**Architecture**:
+| Layer | Component | Purpose |
+|-------|-----------|---------|
+| 1 | Input Grounding | Market data from ContextBuilder (real OHLC, indicators) |
+| 2 | Parallel Analysis | 4 specialized agents analyze independently |
+| 3 | Adversarial Debate | Bull vs Bear challenge each other's reasoning |
+| 4 | Grounding Verification | Compares LLM claims against actual data |
+| 5 | Validation | Risk management and confidence checks |
+| 6 | Execution | Final action with calibrated confidence |
+
+**Graph Flow**:
 ```
-AgentOrchestrator
-    ├─ IndicatorAgent (weight: 1.0)
-    │   └─ RSI, MACD, ADX (+DI/-DI), Stochastic (%K/%D), Williams %R, MFI analysis
-    ├─ TrendAgent (weight: 1.2)
-    │   └─ EMA structure, price structure, support/resistance
-    └─ SentimentAgent (weight: 0.8)
-        └─ Funding rate, long/short ratio, OI, Fear & Greed
-            ↓
-    Weighted Consensus Aggregation → Injected into ConsensusClient
+START
+  │
+  ▼
+[analysis_subgraph] ──► 4 agents parallel (fan-out/fan-in)
+  │
+  ▼
+[route_entry_or_position]
+  │
+  ├─── has_position=False ───► ENTRY PATH
+  │    │
+  │    ▼
+  │  [debate_subgraph] ──► Bull → Bear → Judge (Layer 3)
+  │    │
+  │    ▼
+  │  [grounding_node] ──► Layer 4 verification
+  │    │
+  │    ├── Hallucination > 50% ──► END (signal_wait)
+  │    └── Hallucination < 50% ──► Continue
+  │    │
+  │    ▼
+  │  [validator_node] → [executor_node] → END
+  │
+  └─── has_position=True ────► POSITION PATH
+       │
+       ▼
+     [position_subgraph] ──► PosBull → PosBear → PosJudge → PosGrounding
+       │
+       ▼
+     [position_validator] → [executor_node] → END
 ```
 
 **Module Files**:
-- `agents/agent_state.py`: State management (`AgentState`, `AgentReport`, `Signal`, `Direction`)
-- `agents/base_agent.py`: Abstract base class with standardized prompt/response handling
-- `agents/indicator_agent.py`: Technical indicator analysis specialist
-- `agents/trend_agent.py`: Trend structure and price level analysis
-- `agents/sentiment_agent.py`: Market sentiment and positioning analysis
-- `agents/orchestrator.py`: Coordinates agents, aggregates results via weighted voting
+- `trading_graph/state.py`: TypedDict state schemas (`TradingDecisionState`, `AnalysisState`, `DebateState`, enums)
+- `trading_graph/main_graph.py`: Main StateGraph builder with `TradingGraphRunner` class
+- `trading_graph/edges/routing.py`: Conditional edge routing functions
+- `trading_graph/subgraphs/analysis_graph.py`: Parallel analysis fan-out/fan-in
+- `trading_graph/subgraphs/debate_graph.py`: Bull → Bear → Judge sequential
+- `trading_graph/subgraphs/position_graph.py`: Position management debate
+- `trading_graph/nodes/analysis/`: Analysis agent nodes (indicator, trend, sentiment, pattern, aggregator)
+- `trading_graph/nodes/debate/`: Debate nodes (bull, bear, judge)
+- `trading_graph/nodes/position/`: Position management nodes
+- `trading_graph/nodes/verification/`: Grounding verification node
+- `trading_graph/nodes/execution/`: Validator and executor nodes
 
-**Consensus Calculation**:
-- Direction votes weighted by agent confidence × agent weight
-- Default weights: Trend (1.2) > Indicator (1.0) > Sentiment (0.8)
-- Confidence = average of agreeing agents' confidence levels
-- Key levels aggregated from all agent reports
-
-**Agent Report Format** (standardized output):
-```
-[信号列表]
-- signal_type: description (strength: strong/medium/weak)
-
-[方向判断]
-long / short / neutral
-
-[置信度]
-0-100
-
-[关键价位]
-支撑: price
-阻力: price
-
-[分析摘要]
-Brief analysis summary
+**Agent Weights** (in `state.py`):
+```python
+AGENT_WEIGHTS = {
+    "IndicatorAgent": 1.0,   # Baseline
+    "TrendAgent": 1.2,       # Highest (trend is king)
+    "SentimentAgent": 0.8,   # Lowest (auxiliary)
+    "PatternAgent": 1.1,     # Medium-high
+}
 ```
 
-**Integration with ConsensusClient**:
-- Agents run before dual-role verification
-- Analysis injected as system context for both roles
-- Disabled by default (`multi_agent_enabled: false`)
+**Verdict Enums**:
+- `Verdict`: APPROVE (Bull wins) / REJECT (Bear wins) / ABSTAIN (tie → wait)
+- `PositionVerdict`: HOLD / EXIT / SCALE_IN (+20%~+50%) / PARTIAL_EXIT (-30%~-70%)
+
+**Grounding Verification Details**:
+- Extracts quantitative claims (e.g., "RSI=28", "ADX>25")
+- Extracts qualitative claims (e.g., "RSI超卖", "MACD金叉")
+- Tolerance: 15% deviation allowed before flagging
+- Hallucination thresholds: 30% warning, 50% rejection
+- Confidence penalty: -5% per false claim
 
 ### Four-Layer Stop Loss & Take Profit System
 
@@ -303,26 +347,60 @@ Based on Google Prompt Engineering Whitepaper, the system enforces structured Ch
 **Custom Exit Config** (`custom_exit_config`):
 - Defines Layer 4 extreme take-profit triggers (ROI thresholds, RSI conditions)
 
-**Multi-Agent Config** (within `consensus_config`):
+**LangGraph Debate Config** (within `llm_config`):
 ```json
-"consensus_config": {
-    "enabled": true,
-    "multi_agent_enabled": true,
-    "agent_config": {
-        "parallel_execution": true,
-        "agent_weights": {
-            "IndicatorAgent": 1.0,
-            "TrendAgent": 1.2,
-            "SentimentAgent": 0.8
-        },
-        "enabled_agents": ["indicator", "trend", "sentiment"]
+"llm_config": {
+    "debate_config": {
+        "enabled": true,
+        "min_debate_quality": 60,
+        "confidence_calibration": true,
+        "fallback_on_error": true
     }
 }
 ```
-- `multi_agent_enabled`: Toggle multi-agent pre-analysis (default: false)
-- `parallel_execution`: Run agents concurrently (default: true)
-- `agent_weights`: Relative importance for consensus calculation
-- `enabled_agents`: Which agents to activate (all three by default)
+- `enabled`: Toggle Bull vs Bear debate system (default: true)
+- `min_debate_quality`: Minimum quality threshold for debate arguments
+- `confidence_calibration`: Apply confidence adjustments based on debate outcome
+- `fallback_on_error`: Fall back to signal_wait if LangGraph execution fails
+
+**Consensus Config** (for confidence threshold):
+```json
+"consensus_config": {
+    "enabled": true,
+    "confidence_threshold": 80
+}
+```
+- `confidence_threshold`: Minimum confidence required for entry signals (post-validation)
+
+**Vision Analysis Config** (within `llm_config`):
+```json
+"llm_config": {
+    "use_vision": true,
+    "multi_timeframe_vision": true,
+    "vision_model": "gpt-4o"
+}
+```
+- `use_vision`: Enable K-line chart visual analysis (default: false)
+- `multi_timeframe_vision`: Send dual timeframe charts (15m + 1h) for better analysis (default: true when vision enabled)
+- `vision_model`: Vision-capable model (GPT-4V/GPT-4o, Gemini Pro Vision, etc.)
+
+**Multi-Timeframe Vision Analysis**:
+When `use_vision: true` and `multi_timeframe_vision: true`, PatternAgent and TrendAgent will:
+1. Generate two K-line charts: primary timeframe (15m) + higher timeframe (1h)
+2. Send both images to Vision LLM in a single request
+3. Analyze short-term patterns/trends AND long-term context together
+4. Report mode tag: `[Vision-MTF:15m+1h]`
+
+Coverage with default 50 candles:
+| Timeframe | Coverage |
+|-----------|----------|
+| 15m | 12.5 hours (short-term patterns, entry timing) |
+| 1h | 50 hours (main trend, key support/resistance) |
+
+**Requirements**:
+- Vision-capable LLM (GPT-4V, GPT-4o, Gemini Pro Vision)
+- OHLCV data for both timeframes in State (`ohlcv_data`, `ohlcv_data_htf`)
+- Dependencies: `mplfinance`, `matplotlib`, `pandas`, `numpy`
 
 ## Working with This Codebase
 
@@ -386,35 +464,44 @@ tail -5 user_data/logs/trade_experience.jsonl | jq '{pair, profit_pct, side}'
    - Customize reflection prompts for different insights
    - Adjust trade evaluation criteria
 
-### When Working with Multi-Agent System
+### When Working with LangGraph Trading System
 
-1. **Adding a New Agent**:
-   - Create new file in `llm_modules/agents/` inheriting from `BaseAgent`
-   - Implement `_get_analysis_focus()` to return agent-specific analysis prompt
-   - Register in `orchestrator.py` (`_create_default_agents()` method)
-   - Add to `__init__.py` exports
-   - Update config schema in `consensus_client.py`
+1. **Adding a New Analysis Agent**:
+   - Create node in `trading_graph/nodes/analysis/` (e.g., `new_agent_node.py`)
+   - Add prompt template in `prompts/analysis/` (e.g., `new_agent_prompt.py`)
+   - Register in `subgraphs/analysis_graph.py` parallel fan-out
+   - Update `AGENT_WEIGHTS` in `state.py`
+   - Add to aggregator node's agent list
 
-2. **Modifying Agent Prompts**:
-   - Each agent has `ROLE_PROMPT` class variable defining expertise
-   - `_get_analysis_focus()` returns task-specific analysis instructions
-   - Output format is standardized in `base_agent.py` (`_build_analysis_prompt()`)
+2. **Modifying Debate Flow**:
+   - Edit prompts in `prompts/debate/` (bull_prompt, bear_prompt, judge_prompt)
+   - For position management: edit `position_bull_prompt.py`, `position_bear_prompt.py`, etc.
+   - Modify node logic in `trading_graph/nodes/debate/`
+   - Adjust routing logic in `edges/routing.py`
 
-3. **Adjusting Consensus Weights**:
-   - Edit `agent_weights` in config.json under `consensus_config.agent_config`
-   - Higher weight = more influence on final direction
-   - Default: Trend (1.2) > Indicator (1.0) > Sentiment (0.8)
+3. **Adding Grounding Checks**:
+   - Extend `nodes/verification/grounding_node.py`
+   - Add claim extraction patterns for new indicators
+   - Adjust confidence penalty calculations
+   - Update hallucination threshold if needed
 
-4. **Debugging Agent Analysis**:
-   - Use `consensus_client.get_last_agent_state()` for last analysis state
-   - Check individual agent reports in returned state
-   - Enable debug logging: `logging.getLogger('llm_modules.agents').setLevel(logging.DEBUG)`
-   - Agent analysis is logged when enabled
+4. **Position Management Path**:
+   - Position debate uses separate subgraph (`subgraphs/position_graph.py`)
+   - Has its own Bull/Bear/Judge nodes in `nodes/position/`
+   - Uses `PositionVerdict` enum: HOLD, EXIT, SCALE_IN, PARTIAL_EXIT
+   - Adjustment percentages: +20%~+50% (scale_in), -30%~-70% (partial_exit)
 
-5. **Performance Optimization**:
-   - Set `parallel_execution: true` for concurrent agent calls (default)
-   - Disable unused agents via `enabled_agents` config
+5. **Debugging LangGraph**:
+   - Use `TradingGraphRunner(debug=True)` to enable verbose logging
+   - Access last state: `langgraph_client._last_state` or `langgraph_client.get_last_agent_state()`
+   - Enable debug logging: `logging.getLogger('llm_modules.trading_graph').setLevel(logging.DEBUG)`
+   - Check `llm_decisions.jsonl` for full decision trace with debate results
+
+6. **Performance Optimization**:
+   - Analysis agents run in parallel by default (fan-out/fan-in pattern)
+   - Debate is sequential by design (Bull needs to go before Bear)
    - Reduce agent prompt complexity if timeout issues occur
+   - Vision mode adds latency; disable with `use_vision: false` if not needed
 
 ### Critical Implementation Patterns
 
@@ -460,13 +547,33 @@ tail -5 user_data/logs/trade_experience.jsonl | jq '{pair, profit_pct, side}'
 - Check paths in config.json `experience_config`
 - Use `./manage.sh decisions` to auto-create and tail
 
+**LangGraph execution fails**
+- Check LangChain/LangGraph dependencies: `pip install langgraph langchain-openai`
+- Verify `llm_factory.py` can create chat models with your API config
+- DataFrame serialization issues: checkpointer is disabled by default for this reason
+- Check for import errors in `trading_graph/` modules
+
+**"No clear signal provided" (未提供明确信号) with LangGraph**
+- Ensure `trading_tools` instance is passed to `LangGraphClient` constructor
+- Check `_store_signal_in_cache()` is called successfully after graph execution
+- Verify signal storage isn't cleared before `LLMFunctionStrategy.get_signal()` reads it
+- Enable debug logging to trace signal flow
+
+**Grounding verification rejects valid trades**
+- Check hallucination threshold in `grounding_node.py` (default: 50%)
+- Review claim extraction patterns - may need adjustment for your indicators
+- Tolerance is 15% by default; increase if indicators have natural variance
+- Confidence penalty (-5% per false claim) may be too aggressive
+
 ## Technology Stack
 
 - **Freqtrade 2.x**: Trading framework (Docker: freqtradeorg/freqtrade:stable)
 - **Python 3.11+**: Primary language
+- **LangGraph + LangChain**: Multi-agent orchestration and LLM abstraction
 - **CCXT**: Exchange API abstraction
 - **Pandas + TA-Lib**: Technical analysis
-- **OpenAI-compatible API**: LLM integration
+- **mplfinance**: K-line chart generation for vision analysis
+- **OpenAI-compatible API**: LLM integration (supports any OpenAI-compatible endpoint)
 - **SQLite**: Trade database
 - **Docker + Docker Compose**: Containerization
 
@@ -483,3 +590,4 @@ tail -5 user_data/logs/trade_experience.jsonl | jq '{pair, profit_pct, side}'
 - `README.md`: Comprehensive project documentation (Chinese)
 - `AGENTS.md`: Repository guidelines, testing, and PR conventions
 - `CONFIG_TEMPLATE.md`: Configuration reference
+- `.agent/LLM_TRADING_HALLUCINATION_SOLUTION_REPORT.md`: 6-layer hallucination prevention research and design

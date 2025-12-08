@@ -7,7 +7,12 @@ USER root
 # 安装额外的Python依赖
 RUN pip install --no-cache-dir \
     chromadb>=0.4.22 \
-    requests>=2.31.0
+    requests>=2.31.0 \
+    mplfinance>=0.12.10b0 \
+    matplotlib>=3.7.0 \
+    langchain>=0.3.0 \
+    langchain-openai>=0.2.0 \
+    langgraph>=0.2.0
 
 # 切换回freqtrade用户
 USER ftuser
