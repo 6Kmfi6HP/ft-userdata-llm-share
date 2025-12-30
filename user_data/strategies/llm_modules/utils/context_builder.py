@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class ContextBuilder:
     """LLM上下文构建器（门面类，协调各个模块）"""
 
-    def __init__(self, context_config: Dict[str, Any], historical_query_engine=None, pattern_analyzer=None, tradable_balance_ratio=1.0, max_open_trades=1):
+    def __init__(self, context_config: Dict[str, Any], historical_query_engine=None, pattern_analyzer=None, tradable_balance_ratio=1.0, max_open_trades=1, stake_currency: str = "USDT"):
         """
         初始化上下文构建器
 
@@ -32,12 +32,14 @@ class ContextBuilder:
             pattern_analyzer: 模式分析器实例（可选）
             tradable_balance_ratio: 可交易余额比例（如0.5表示只用50%资金）
             max_open_trades: 最大持仓数量
+            stake_currency: 结算货币
         """
         self.config = context_config
         self.max_tokens = context_config.get("max_context_tokens", 6000)
         self.sentiment = MarketSentiment()  # 初始化市场情绪获取器
         self.tradable_balance_ratio = tradable_balance_ratio
         self.max_open_trades = max_open_trades
+        self.stake_currency = stake_currency
 
         # 学习系统组件
         self.historical_query = historical_query_engine
@@ -47,7 +49,8 @@ class ContextBuilder:
         # 先初始化新的模块化组件（在使用它们之前）
         self.formatter = DataFormatter()
         self.prompt_builder = PromptBuilder(
-            include_timeframe_guidance=context_config.get("include_timeframe_guidance", True)
+            include_timeframe_guidance=context_config.get("include_timeframe_guidance", True),
+            stake_currency=self.stake_currency
         )
 
         self.include_timeframe_guidance = context_config.get(
@@ -274,9 +277,9 @@ class ContextBuilder:
             context_parts.append("")
             context_parts.append("【账户信息】")
             try:
-                total = wallets.get_total('USDT')
-                free = wallets.get_free('USDT')
-                used = wallets.get_used('USDT')
+                total = wallets.get_total(self.stake_currency)
+                free = wallets.get_free(self.stake_currency)
+                used = wallets.get_used(self.stake_currency)
 
                 # 计算实际可用交易余额（考虑tradable_balance_ratio和max_open_trades）
                 tradable_total = total * self.tradable_balance_ratio
@@ -284,11 +287,11 @@ class ContextBuilder:
                 per_trade_avg = tradable_total / self.max_open_trades if self.max_open_trades > 0 else tradable_total
 
                 context_parts.extend([
-                    f"  总余额: {total:.2f} USDT",
-                    f"  可交易余额: {tradable_total:.2f} USDT ({self.tradable_balance_ratio*100:.0f}%资金)",
-                    f"  当前可用: {tradable_free:.2f} USDT",
-                    f"  已用资金: {used:.2f} USDT",
-                    f"  最多{self.max_open_trades}个仓位，平均每个约 {per_trade_avg:.2f} USDT"
+                    f"  总余额: {total:.2f} {self.stake_currency}",
+                    f"  可交易余额: {tradable_total:.2f} {self.stake_currency} ({self.tradable_balance_ratio*100:.0f}%资金)",
+                    f"  当前可用: {tradable_free:.2f} {self.stake_currency}",
+                    f"  已用资金: {used:.2f} {self.stake_currency}",
+                    f"  最多{self.max_open_trades}个仓位，平均每个约 {per_trade_avg:.2f} {self.stake_currency}"
                 ])
             except Exception as e:
                 context_parts.append(f"  无法获取账户信息: {e}")
@@ -602,8 +605,8 @@ class ContextBuilder:
                     f"  开仓价格: {open_rate:.2f}",
                     f"  当前价格: {current_rate:.2f}",
                     f"  持仓数量: {amount:.4f}",
-                    f"  投入资金: {stake_amount:.2f} USDT",
-                    f"  当前盈亏: {profit_pct:.2f}% ({profit_abs:+.2f} USDT)",
+                    f"  投入资金: {stake_amount:.2f} {self.stake_currency}",
+                    f"  当前盈亏: {profit_pct:.2f}% ({profit_abs:+.2f} {self.stake_currency})",
                     f"  持仓时间: {days}天{hours}小时{mins}分钟",
                 ])
             else:
@@ -634,8 +637,8 @@ class ContextBuilder:
                     f"  开仓价格: {trade.open_rate:.2f}",
                     f"  当前价格: {current_rate:.2f}",
                     f"  持仓数量: {trade.amount:.4f}",
-                    f"  投入资金: {getattr(trade, 'stake_amount', 0):.2f} USDT",
-                    f"  当前盈亏: {profit_pct:.2f}% ({profit_abs:+.2f} USDT)",
+                    f"  投入资金: {getattr(trade, 'stake_amount', 0):.2f} {self.stake_currency}",
+                    f"  当前盈亏: {profit_pct:.2f}% ({profit_abs:+.2f} {self.stake_currency})",
                     f"  持仓时间: {duration_str}",
                 ])
 
@@ -975,18 +978,18 @@ class ContextBuilder:
             "根据置信度决定投入金额：",
             "",
             "高置信度：多维度确认，趋势强劲",
-            "  可考虑投入300-400 USDT（假设余额1000 USDT）",
+            f"  可考虑投入300-400 {self.stake_currency}（假设余额1000 {self.stake_currency}）",
             "  例如：4h+1h趋势一致，ADX>25且上升，突破确认",
             "",
             "中等置信度：部分确认，趋势中等",
-            "  可考虑投入200-300 USDT（假设余额1000 USDT）",
+            f"  可考虑投入200-300 {self.stake_currency}（假设余额1000 {self.stake_currency}）",
             "  例如：4h趋势明确，1h有入场信号，ADX 20-25",
             "",
             "低置信度：信号较弱，但有机会",
-            "  可考虑投入100-200 USDT（假设余额1000 USDT）",
+            f"  可考虑投入100-200 {self.stake_currency}（假设余额1000 {self.stake_currency}）",
             "  例如：趋势初现，但未完全确认",
             "",
-            "通过stake_amount参数指定具体USDT金额：",
+            f"通过stake_amount参数指定具体{self.stake_currency}金额：",
             "  查看【账户信息】中的可用余额",
             "  根据你的置信度和余额计算",
             "  如果不设置，系统使用默认仓位",
@@ -1118,7 +1121,7 @@ class ContextBuilder:
             "  根据趋势强度和当前盈利决定：",
             "    趋势强（ADX>30）+ 当前盈利>5% = 可加仓50-100%（相对当前仓位）",
             "    趋势中等（ADX 25-30）+ 当前盈利3-5% = 可加仓30-50%（相对当前仓位）",
-            "  例如：当前仓位100 USDT，加仓50%，则增加50 USDT",
+            f"  例如：当前仓位100 {self.stake_currency}，加仓50%，则增加50 {self.stake_currency}",
             "",
             "不允许加仓的情况：",
             "  当前持仓亏损 = 绝对不加仓（不要摊平亏损）",

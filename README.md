@@ -199,7 +199,12 @@ chmod +x manage.sh
 
 ### 2. 交易所配置
 
+本策略支持 **Binance** 和 **Hyperliquid** 交易所。详细配置模板请参考 [CONFIG_TEMPLATE.md](CONFIG_TEMPLATE.md)。
+
+#### Binance (默认)
+
 ```json
+"stake_currency": "USDT",
 "exchange": {
     "name": "binance",
     "key": "your-api-key",
@@ -207,9 +212,35 @@ chmod +x manage.sh
     "ccxt_config": {
         "enableRateLimit": true,
         "options": { "defaultType": "future" }
+    },
+    "ccxt_async_config": {
+        "enableRateLimit": true,
+        "rateLimit": 200,
+        "timeout": 30000
     }
 }
 ```
+
+#### Hyperliquid
+
+```json
+"stake_currency": "USDC",
+"exchange": {
+    "name": "hyperliquid",
+    "walletAddress": "0x<your-wallet-address-40-hex-chars>",
+    "privateKey": "0x<your-api-wallet-private-key-64-hex-chars>",
+    "ccxt_config": {
+        "enableRateLimit": true
+    }
+}
+```
+
+| 特性 | Binance | Hyperliquid |
+|------|---------|-------------|
+| 结算货币 | USDT | USDC |
+| 认证方式 | API key + secret | 钱包地址 + 私钥 |
+| 交易对格式 | `BTC/USDT:USDT` | `BTC/USDC:USDC` |
+| 历史K线 | 无限制 | 最多5000根 |
 
 ### 3. 风险管理
 

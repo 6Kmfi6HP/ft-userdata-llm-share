@@ -140,7 +140,7 @@ class MarketSentiment:
 
         参数:
             exchange: Freqtrade exchange 对象
-            pair: 交易对，如 'BTC/USDT:USDT'
+            pair: 交易对 (格式: 'BASE/QUOTE:QUOTE')
 
         返回:
         {
@@ -238,7 +238,7 @@ class MarketSentiment:
         获取币安多空比历史数据（30天，1小时间隔）
 
         参数:
-            pair: 交易对，如 'BTC/USDT:USDT'
+            pair: 交易对 (格式: 'BASE/QUOTE:QUOTE')
 
         返回:
         {
@@ -258,8 +258,9 @@ class MarketSentiment:
                 return cache_entry['data']
 
         try:
-            # 转换交易对格式：BTC/USDT:USDT -> BTCUSDT
-            symbol = pair.replace('/USDT:USDT', 'USDT').replace('/', '')
+            # 提取基础货币并转换为Binance格式 (BASE/QUOTE:QUOTE -> BASEUSDT)
+            base_symbol = pair.split('/')[0].upper()
+            symbol = f"{base_symbol}USDT"
 
             # 币安API：全局多空账户比
             url = "https://fapi.binance.com/futures/data/globalLongShortAccountRatio"

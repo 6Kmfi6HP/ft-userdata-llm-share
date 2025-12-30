@@ -23,6 +23,8 @@ class TradingTools:
 
     def get_tools_schema(self) -> list[Dict[str, Any]]:
         """获取所有交易工具的OpenAI函数schema"""
+        currency = getattr(self.strategy, 'stake_currency', 'USDT')
+        pair_example = f"BTC/{currency}:{currency}"
         return [
             {
                 "name": "signal_entry_long",
@@ -32,7 +34,7 @@ class TradingTools:
                     "properties": {
                         "pair": {
                             "type": "string",
-                            "description": "交易对，例如 BTC/USDT:USDT"
+                            "description": f"交易对，例如 {pair_example}"
                         },
                         "leverage": {
                             "type": "number",
@@ -60,7 +62,7 @@ class TradingTools:
                         },
                         "stake_amount": {
                             "type": "number",
-                            "description": "本次计划投入的USDT金额（留空则使用默认仓位）"
+                            "description": f"本次计划投入的{currency}金额（留空则使用默认仓位）"
                         },
                         "reason": {
                             "type": "string",
@@ -106,7 +108,7 @@ class TradingTools:
                         },
                         "stake_amount": {
                             "type": "number",
-                            "description": "本次计划投入的USDT金额（留空则使用默认仓位）"
+                            "description": f"本次计划投入的{currency}金额（留空则使用默认仓位）"
                         },
                         "reason": {
                             "type": "string",
@@ -293,7 +295,8 @@ class TradingTools:
 
             self.strategy._leverage_cache[pair] = leverage
 
-            stake_msg = f" | 投入: {stake_amount:.2f} USDT" if stake_amount else ""
+            currency = getattr(self.strategy, 'stake_currency', 'USDT')
+            stake_msg = f" | 投入: {stake_amount:.2f} {currency}" if stake_amount else ""
             logger.info(f"[做多信号] {pair} | 置信度: {confidence_score} | 杠杆: {leverage}x{stake_msg}")
             logger.info(f"  支撑: {key_support} | 阻力: {key_resistance} | RSI: {rsi_value} | 趋势强度: {trend_strength}")
             logger.info(f"  理由: {reason}")
@@ -375,7 +378,8 @@ class TradingTools:
 
             self.strategy._leverage_cache[pair] = leverage
 
-            stake_msg = f" | 投入: {stake_amount:.2f} USDT" if stake_amount else ""
+            currency = getattr(self.strategy, 'stake_currency', 'USDT')
+            stake_msg = f" | 投入: {stake_amount:.2f} {currency}" if stake_amount else ""
             logger.info(f"[做空信号] {pair} | 置信度: {confidence_score} | 杠杆: {leverage}x{stake_msg}")
             logger.info(f"  支撑: {key_support} | 阻力: {key_resistance} | RSI: {rsi_value} | 趋势强度: {trend_strength}")
             logger.info(f"  理由: {reason}")
