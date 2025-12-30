@@ -11,14 +11,16 @@ logger = logging.getLogger(__name__)
 class PromptBuilder:
     """LLM提示词构建器"""
 
-    def __init__(self, include_timeframe_guidance: bool = True):
+    def __init__(self, include_timeframe_guidance: bool = True, stake_currency: str = "USDT"):
         """
         初始化提示词构建器
 
         Args:
             include_timeframe_guidance: 是否包含时间框架指导
+            stake_currency: 结算货币
         """
         self.include_timeframe_guidance = include_timeframe_guidance
+        self.stake_currency = stake_currency
 
     def build_entry_prompt(self) -> str:
         """
@@ -397,7 +399,7 @@ EMA：
 
     def _add_position_strategy(self) -> str:
         """仓位调整工具"""
-        return """【仓位调整工具】
+        return f"""【仓位调整工具】
 
 adjust_position 函数用于调整现有仓位大小。
 
@@ -410,9 +412,9 @@ adjust_position 函数用于调整现有仓位大小。
   reason: 调整理由
 
 示例：
-  当前仓位100 USDT
-  adjustment_pct=50 表示加仓50 USDT（总仓位变为150 USDT）
-  adjustment_pct=-30 表示减仓30 USDT（总仓位变为70 USDT）
+  当前仓位100 {self.stake_currency}
+  adjustment_pct=50 表示加仓50 {self.stake_currency}（总仓位变为150 {self.stake_currency}）
+  adjustment_pct=-30 表示减仓30 {self.stake_currency}（总仓位变为70 {self.stake_currency}）
 
 加仓的作用：
   增加仓位规模，放大潜在收益，但同时增加风险敞口。

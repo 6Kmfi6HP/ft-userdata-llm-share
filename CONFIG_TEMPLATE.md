@@ -21,16 +21,79 @@
 
 ### 2. 交易所 API 配置
 
-在 `user_data/config.json` 的 `exchange` 部分填写：
+本策略支持 **Binance** 和 **Hyperliquid** 交易所。
+
+#### Binance (默认)
 
 ```json
+"stake_currency": "USDT",
 "exchange": {
     "name": "binance",
     "key": "your-binance-api-key",
-    "secret": "your-binance-secret",
-    ...
+    "secret": "your-binance-api-secret",
+    "ccxt_config": {
+        "enableRateLimit": true,
+        "options": {
+            "defaultType": "future"
+        }
+    },
+    "ccxt_async_config": {
+        "enableRateLimit": true,
+        "rateLimit": 200,
+        "timeout": 30000
+    }
 }
 ```
+
+**Binance API 设置步骤：**
+
+1. 访问 [Binance API Management](https://www.binance.com/en/my/settings/api-management)
+2. 创建新的 API 密钥
+3. 启用 **Futures** 权限
+4. 限制 IP 地址访问（推荐）
+5. 将 API key 和 secret 复制到配置文件
+
+#### Hyperliquid
+
+```json
+"stake_currency": "USDC",
+"exchange": {
+    "name": "hyperliquid",
+    "walletAddress": "0x<your-wallet-address-40-hex-chars>",
+    "privateKey": "0x<your-api-wallet-private-key-64-hex-chars>",
+    "ccxt_config": {
+        "enableRateLimit": true
+    },
+    "ccxt_async_config": {
+        "enableRateLimit": true
+    }
+}
+```
+
+**Hyperliquid API 设置步骤：**
+
+1. 访问 [Hyperliquid App](https://app.hyperliquid.xyz/)
+2. 连接你的钱包
+3. 进入 **Settings** > **API Wallet**
+4. 创建新的 API 钱包（系统会生成一个独立的交易钱包）
+5. 将 **钱包地址** 和 **私钥** 复制到配置文件
+
+**重要提示：**
+
+- 使用 **API 钱包** 凭证，而非主钱包
+- API 钱包权限受限，更安全
+- 需要向 API 钱包充值 USDC 才能交易
+
+#### 交易所对比
+
+| 特性 | Binance | Hyperliquid |
+| ---- | ------- | ----------- |
+| 结算货币 | USDT | USDC |
+| 认证方式 | API key + secret | 钱包地址 + 私钥 |
+| 交易对格式 | `BTC/USDT:USDT` | `BTC/USDC:USDC` |
+| 历史K线 | 无限制 | 最多5000根 |
+| 市价单 | 原生支持 | 限价单模拟（5%滑点） |
+| 配置字段 | `key`, `secret` | `walletAddress`, `privateKey` |
 
 **安全建议：**
 

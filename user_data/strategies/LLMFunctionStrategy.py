@@ -110,12 +110,14 @@ class LLMFunctionStrategy(IStrategy):
             logger.info("✓ 自我学习系统已初始化 (HistoricalQuery, PatternAnalyzer, SelfReflection, TradeEvaluator, RewardLearning)")
 
             # 3. 初始化上下文构建器（注入学习组件）
+            self.stake_currency = config.get('stake_currency', 'USDT')
             self.context_builder = ContextBuilder(
                 context_config=self.context_config,
                 historical_query_engine=self.historical_query,
                 pattern_analyzer=self.pattern_analyzer,
                 tradable_balance_ratio=config.get('tradable_balance_ratio', 1.0),
-                max_open_trades=config.get('max_open_trades', 1)
+                max_open_trades=config.get('max_open_trades', 1),
+                stake_currency=self.stake_currency
             )
 
             # 4. 初始化函数执行器
@@ -906,10 +908,10 @@ class LLMFunctionStrategy(IStrategy):
 
         # 只检查最小值，不限制最大值（由tradable_balance_ratio自然限制）
         if min_stake and desired < min_stake:
-            logger.warning(f"{pair} 指定投入 {stake_request:.2f} USDT 低于最小要求 {min_stake:.2f}，已调整为最小值")
+            logger.warning(f"{pair} 指定投入 {stake_request:.2f} {self.stake_currency} 低于最小要求 {min_stake:.2f}，已调整为最小值")
             desired = min_stake
 
-        logger.info(f"{pair} 使用LLM指定仓位: {desired:.2f} USDT (请求 {stake_request:.2f})")
+        logger.info(f"{pair} 使用LLM指定仓位: {desired:.2f} {self.stake_currency} (请求 {stake_request:.2f})")
         return desired
 
     def adjust_trade_position(
@@ -958,7 +960,7 @@ class LLMFunctionStrategy(IStrategy):
                     logger.warning(f"{pair} 加仓金额 {adjustment_stake} 低于最小stake {min_stake}")
                     return None
 
-                logger.info(f"{pair} 加仓 {adjustment_pct:.1f}% = {adjustment_stake:.2f} USDT | {reason}")
+                logger.info(f"{pair} 加仓 {adjustment_pct:.1f}% = {adjustment_stake:.2f} {self.stake_currency} | {reason}")
                 return adjustment_stake
 
             elif adjustment_pct < 0:
@@ -966,7 +968,7 @@ class LLMFunctionStrategy(IStrategy):
                 max_reduce = -current_stake * 0.99  # 最多减99%（保留一点避免完全平仓）
                 adjustment_stake = max(adjustment_stake, max_reduce)
 
-                logger.info(f"{pair} 减仓 {abs(adjustment_pct):.1f}% = {adjustment_stake:.2f} USDT | {reason}")
+                logger.info(f"{pair} 减仓 {abs(adjustment_pct):.1f}% = {adjustment_stake:.2f} {self.stake_currency} | {reason}")
                 return adjustment_stake
 
         # 无调整
